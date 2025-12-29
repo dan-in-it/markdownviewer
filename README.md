@@ -17,6 +17,10 @@ A Windows GUI Markdown file viewer written in Rust (built with `eframe`/`egui`).
 
 ## Usage
 
+Download the Windows executable from GitHub:
+
+- On the repository page, use the **Releases** section on the right side to download the latest `markdownviewer.exe`.
+
 Run the app:
 
 ```bash
