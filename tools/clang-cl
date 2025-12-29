@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Minimal `clang-cl` shim that translates the subset of MSVC/clang-cl flags we encounter
+# when cross-compiling to `*-windows-msvc` from non-Windows hosts, and then invokes `zig cc`.
+
+if [[ "${1:-}" == "-V" && "${2:-}" == "/?" ]]; then
+  echo "clang-cl (zig wrapper)"
+  exit 0
+fi
+if [[ "${1:-}" == "/?" || "${1:-}" == "-?" ]]; then
+  echo "clang-cl (zig wrapper)"
+  exit 0
+fi
+
+args=()
+while [[ "$#" -gt 0 ]]; do
+  case "$1" in
+    --)
+      shift;;
+    --target=*-pc-windows-msvc)
+      args+=("${1/-pc-windows-msvc/-windows-msvc}");
+      shift;;
+    -target)
+      if [[ "${2:-}" == *-pc-windows-msvc ]]; then
+        args+=("-target" "${2/-pc-windows-msvc/-windows-msvc}");
+        shift 2
+      else
+        args+=("$1" "$2"); shift 2
+      fi
+      ;;
+    /imsvc)
+      args+=("-isystem" "$2"); shift 2;;
+    /I)
+      args+=("-I" "$2"); shift 2;;
+    /I*)
+      args+=("-I" "${1:2}"); shift;;
+    /D)
+      args+=("-D" "$2"); shift 2;;
+    /D*)
+      args+=("-D" "${1:2}"); shift;;
+    /nologo)
+      shift;;
+    -nologo)
+      shift;;
+    /Z7|/Zi)
+      args+=("-g"); shift;;
+    /Od)
+      args+=("-O0"); shift;;
+    /O1)
+      args+=("-O1"); shift;;
+    /O2)
+      args+=("-O2"); shift;;
+    /MT|/MTd|/MD|/MDd)
+      # Runtime selection flags (MSVC). For our use (building static objects) we can ignore these.
+      shift;;
+    /Gy|/Gw|/GF)
+      shift;;
+    /Zc:*)
+      shift;;
+    /W0|/W1|/W2|/W3|/W4|/Wall)
+      shift;;
+    /wd*)
+      shift;;
+    -Fo*)
+      args+=("-o" "${1:3}"); shift;;
+    *)
+      args+=("$1"); shift;;
+  esac
+done
+
+exec zig cc "${args[@]}"

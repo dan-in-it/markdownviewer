@@ -1,0 +1,4 @@
+[env]
+# `cargo xwin build --target x86_64-pc-windows-msvc` needs a C compiler for a few crates (e.g. `ring`).
+# On non-Windows hosts, provide a small `clang-cl` wrapper backed by `zig cc`.
+CC_x86_64_pc_windows_msvc = { value = "tools/clang-cl", force = true, relative = true }

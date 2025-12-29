@@ -1,6 +1,17 @@
 # markdownviewer
 
-A basic Windows GUI Markdown file viewer written in Rust (built with `eframe`/`egui`).
+A Windows GUI Markdown file viewer written in Rust (built with `eframe`/`egui`).
+
+## Features
+
+- CommonMark + GitHub Flavored Markdown (tables, task lists, strikethrough)
+- Footnotes, definition lists, and GitHub-style callouts/admonitions
+- Math rendering (`$...$` / `$$...$$`) via MathJax → SVG
+- Mermaid diagrams via Kroki (` ```mermaid ` fences → SVG; requires internet)
+- Syntax highlighting + copy buttons (with best-effort language auto-detect)
+- Light/Dark/System theme toggle
+- Emoji shortcodes (`:rocket:`) + URL autolinks + GitHub issue/PR links (`#123`, `PR#123`)
+- Optional smart typography (off by default)
 
 ## Usage
 
@@ -21,6 +32,17 @@ Build a Windows executable:
 ```bash
 cargo build --release
 ```
+
+Cross-compile a Windows `.exe` from Linux/WSL (requires `cargo-xwin`):
+
+```bash
+cargo install cargo-xwin
+cargo xwin build --target x86_64-pc-windows-msvc --release
+```
+
+Notes:
+
+- Cross-compiling uses `zig` as a `clang-cl` shim via `.cargo/config.toml` + `tools/clang-cl`.
 
 Open a file:
 
