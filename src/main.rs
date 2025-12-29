@@ -338,34 +338,34 @@ impl eframe::App for MarkdownViewerApp {
 
                 ui.separator();
 
+                let theme_before = self.settings.theme_preference;
+                ui.selectable_value(
+                    &mut self.settings.theme_preference,
+                    egui::ThemePreference::System,
+                    "💻",
+                )
+                .on_hover_text("Follow the system theme");
+                ui.selectable_value(
+                    &mut self.settings.theme_preference,
+                    egui::ThemePreference::Dark,
+                    "🌙",
+                )
+                .on_hover_text("Dark theme");
+                ui.selectable_value(
+                    &mut self.settings.theme_preference,
+                    egui::ThemePreference::Light,
+                    "☀",
+                )
+                .on_hover_text("Light theme");
+                if theme_before != self.settings.theme_preference {
+                    ctx.set_theme(self.settings.theme_preference);
+                    self.clear_render_caches();
+                }
+
+                ui.separator();
+
                 ui.menu_button("Options", |ui| {
                     let mut changed = false;
-
-                    let theme_before = self.settings.theme_preference;
-                    ui.horizontal(|ui| {
-                        ui.label("Theme:");
-                        ui.selectable_value(
-                            &mut self.settings.theme_preference,
-                            egui::ThemePreference::Light,
-                            "Light",
-                        );
-                        ui.selectable_value(
-                            &mut self.settings.theme_preference,
-                            egui::ThemePreference::Dark,
-                            "Dark",
-                        );
-                        ui.selectable_value(
-                            &mut self.settings.theme_preference,
-                            egui::ThemePreference::System,
-                            "System",
-                        );
-                    });
-                    if theme_before != self.settings.theme_preference {
-                        ctx.set_theme(self.settings.theme_preference);
-                        self.clear_render_caches();
-                    }
-
-                    ui.separator();
                     changed |= ui
                         .checkbox(
                             &mut self.settings.render_math,
