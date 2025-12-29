@@ -202,12 +202,77 @@ struct MermaidKey {
     source: String,
 }
 
-struct MarkdownViewerApp {
-    commonmark_cache: CommonMarkCache,
+struct Document {
     raw_markdown: String,
     markdown: String,
     file_path: Option<PathBuf>,
     github_repo: Option<GithubRepo>,
+    commonmark_cache: CommonMarkCache,
+}
+
+impl Document {
+    fn welcome(settings: &ViewerSettings) -> Self {
+        let raw_markdown = String::from(
+            "# markdownviewer\n\nOpen a `.md` file to view it.\n\n- Use **Open…** or drag and drop a file.\n- Use **Reload** to re-read the current file.\n",
+        );
+        Self::from_content(raw_markdown, None, settings)
+    }
+
+    fn from_path(path: PathBuf, settings: &ViewerSettings) -> Result<Self> {
+        let raw_markdown = read_markdown(&path)?;
+        Ok(Self::from_content(raw_markdown, Some(path), settings))
+    }
+
+    fn from_content(
+        raw_markdown: String,
+        file_path: Option<PathBuf>,
+        settings: &ViewerSettings,
+    ) -> Self {
+        let github_repo = file_path.as_deref().and_then(|p| discover_github_repo(p));
+
+        let mut doc = Self {
+            raw_markdown,
+            markdown: String::new(),
+            file_path,
+            github_repo,
+            commonmark_cache: CommonMarkCache::default(),
+        };
+        doc.rebuild_markdown(settings);
+        doc
+    }
+
+    fn rebuild_markdown(&mut self, settings: &ViewerSettings) {
+        self.markdown =
+            preprocess_markdown(&self.raw_markdown, settings, self.github_repo.as_ref());
+        self.commonmark_cache = CommonMarkCache::default();
+    }
+
+    fn reload(&mut self, settings: &ViewerSettings) -> Result<()> {
+        let path = self.file_path.clone().context("no file to reload")?;
+        self.raw_markdown = read_markdown(&path)?;
+        self.github_repo = discover_github_repo(&path);
+        self.rebuild_markdown(settings);
+        Ok(())
+    }
+
+    fn display_name(&self) -> String {
+        match &self.file_path {
+            Some(path) => path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.display().to_string()),
+            None => "Welcome".to_string(),
+        }
+    }
+
+    fn tooltip(&self) -> Option<String> {
+        self.file_path.as_ref().map(|p| p.display().to_string())
+    }
+}
+
+struct MarkdownViewerApp {
+    documents: Vec<Document>,
+    active_doc: usize,
     settings: ViewerSettings,
     math_cache: Arc<Mutex<HashMap<MathKey, SvgState>>>,
     math_tx: mpsc::Sender<MathKey>,
@@ -234,13 +299,8 @@ impl MarkdownViewerApp {
         spawn_mermaid_worker(cc.egui_ctx.clone(), mermaid_cache.clone(), mermaid_rx);
 
         let mut app = Self {
-            commonmark_cache: CommonMarkCache::default(),
-            raw_markdown: String::from(
-                "# markdownviewer\n\nOpen a `.md` file to view it.\n\n- Use **Open…** or drag and drop a file.\n- Use **Reload** to re-read the current file.\n",
-            ),
-            markdown: String::new(),
-            file_path: None,
-            github_repo: None,
+            documents: vec![Document::welcome(&ViewerSettings::default())],
+            active_doc: 0,
             settings: ViewerSettings::default(),
             math_cache,
             math_tx,
@@ -251,9 +311,8 @@ impl MarkdownViewerApp {
 
         cc.egui_ctx.set_theme(app.settings.theme_preference);
 
-        app.rebuild_markdown();
         if let Some(path) = std::env::args_os().nth(1).map(PathBuf::from) {
-            let _ = app.load_file(path);
+            let _ = app.open_file(path);
         }
 
         app
@@ -264,50 +323,66 @@ impl MarkdownViewerApp {
             "Markdown",
             &["md", "markdown", "mdown", "mkd", "mkdn", "mdtxt"],
         );
-        if let Some(path) = &self.file_path {
+        if let Some(path) = self.active_document().and_then(|d| d.file_path.as_ref()) {
             if let Some(parent) = path.parent() {
                 dialog = dialog.set_directory(parent);
             }
         }
         if let Some(path) = dialog.pick_file() {
-            let _ = self.load_file(path);
+            let _ = self.open_file(path);
         }
     }
 
-    fn load_file(&mut self, path: PathBuf) -> Result<()> {
-        let markdown = read_markdown(&path)?;
-        self.commonmark_cache = CommonMarkCache::default();
-        self.raw_markdown = markdown;
-        self.file_path = Some(path);
-        self.github_repo = self
-            .file_path
-            .as_deref()
-            .and_then(|p| discover_github_repo(p));
-        self.rebuild_markdown();
-        self.error = None;
+    fn open_file(&mut self, path: PathBuf) -> Result<()> {
+        if let Some(idx) = self
+            .documents
+            .iter()
+            .position(|doc| doc.file_path.as_ref() == Some(&path))
+        {
+            self.active_doc = idx;
+            if let Err(err) = self.documents[idx].reload(&self.settings) {
+                self.error = Some(err.to_string());
+            } else {
+                self.error = None;
+            }
+            return Ok(());
+        }
+
+        match Document::from_path(path, &self.settings) {
+            Ok(doc) => {
+                self.documents.push(doc);
+                self.active_doc = self.documents.len().saturating_sub(1);
+                self.error = None;
+            }
+            Err(err) => {
+                self.error = Some(err.to_string());
+            }
+        }
         Ok(())
     }
 
-    fn reload(&mut self) {
-        let Some(path) = self.file_path.clone() else {
+    fn reload_active(&mut self) {
+        let settings = self.settings.clone();
+        let Some(doc) = self.active_document_mut() else {
             return;
         };
-        if let Err(e) = self.load_file(path) {
+        if let Err(e) = doc.reload(&settings) {
             self.error = Some(e.to_string());
+        } else {
+            self.error = None;
         }
     }
 
-    fn rebuild_markdown(&mut self) {
-        self.markdown = preprocess_markdown(
-            &self.raw_markdown,
-            &self.settings,
-            self.github_repo.as_ref(),
-        );
-        self.commonmark_cache = CommonMarkCache::default();
+    fn rebuild_all_markdown(&mut self) {
+        for doc in &mut self.documents {
+            doc.rebuild_markdown(&self.settings);
+        }
     }
 
     fn clear_render_caches(&mut self) {
-        self.commonmark_cache = CommonMarkCache::default();
+        for doc in &mut self.documents {
+            doc.commonmark_cache = CommonMarkCache::default();
+        }
         if let Ok(mut map) = self.math_cache.lock() {
             map.clear();
         }
@@ -315,108 +390,196 @@ impl MarkdownViewerApp {
             map.clear();
         }
     }
+
+    fn active_document(&self) -> Option<&Document> {
+        self.documents.get(self.active_doc)
+    }
+
+    fn active_document_mut(&mut self) -> Option<&mut Document> {
+        self.documents.get_mut(self.active_doc)
+    }
+
+    fn close_tab(&mut self, idx: usize) {
+        if idx >= self.documents.len() {
+            return;
+        }
+        self.documents.remove(idx);
+        if self.documents.is_empty() {
+            self.documents.push(Document::welcome(&self.settings));
+            self.active_doc = 0;
+        } else if self.active_doc >= self.documents.len() {
+            self.active_doc = self.documents.len() - 1;
+        }
+    }
+
+    fn show_tab_bar(&mut self, ui: &mut egui::Ui) {
+        let mut close_tab = None::<usize>;
+        egui::ScrollArea::horizontal()
+            .id_salt("tab_bar_scroll")
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    for (idx, doc) in self.documents.iter().enumerate() {
+                        let is_active = idx == self.active_doc;
+                        let fill = if is_active {
+                            ui.visuals().selection.bg_fill
+                        } else {
+                            ui.visuals().faint_bg_color
+                        };
+                        let stroke_color = ui.visuals().widgets.noninteractive.bg_stroke.color;
+                        let response = egui::Frame::new()
+                            .fill(fill)
+                            .stroke(egui::Stroke::new(1.0, stroke_color))
+                            .corner_radius(egui::CornerRadius::same(6))
+                            .inner_margin(egui::Margin::symmetric(8, 6))
+                            .show(ui, |ui| {
+                                ui.set_min_width(120.0);
+                                ui.horizontal(|ui| {
+                                    let label = doc.display_name();
+                                    let mut label_resp =
+                                        ui.selectable_label(is_active, label.clone());
+                                    if let Some(tt) = doc.tooltip() {
+                                        label_resp = label_resp.on_hover_text(tt);
+                                    }
+                                    if label_resp.clicked() {
+                                        self.active_doc = idx;
+                                    }
+                                    if ui
+                                        .add(
+                                            egui::Button::new("×")
+                                                .small()
+                                                .fill(egui::Color32::TRANSPARENT),
+                                        )
+                                        .on_hover_text("Close tab")
+                                        .clicked()
+                                    {
+                                        close_tab = Some(idx);
+                                    }
+                                });
+                            })
+                            .response;
+                        if response.clicked() {
+                            self.active_doc = idx;
+                        }
+                    }
+                });
+            });
+        if let Some(idx) = close_tab {
+            self.close_tab(idx);
+        }
+    }
 }
 
 impl eframe::App for MarkdownViewerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if let Some(path) = ctx.input(|i| i.raw.dropped_files.iter().find_map(|f| f.path.clone())) {
-            let _ = self.load_file(path);
+            let _ = self.open_file(path);
         }
 
         egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                if ui.button("Open…").clicked() {
-                    self.open_dialog();
-                }
-                let reload_enabled = self.file_path.is_some();
-                if ui
-                    .add_enabled(reload_enabled, egui::Button::new("Reload"))
-                    .clicked()
-                {
-                    self.reload();
-                }
+            ui.vertical(|ui| {
+                ui.horizontal(|ui| {
+                    if ui.button("Open…").clicked() {
+                        self.open_dialog();
+                    }
+                    let reload_enabled = self
+                        .active_document()
+                        .and_then(|d| d.file_path.as_ref())
+                        .is_some();
+                    if ui
+                        .add_enabled(reload_enabled, egui::Button::new("Reload"))
+                        .clicked()
+                    {
+                        self.reload_active();
+                    }
 
-                ui.separator();
+                    ui.separator();
 
-                let theme_before = self.settings.theme_preference;
-                ui.selectable_value(
-                    &mut self.settings.theme_preference,
-                    egui::ThemePreference::System,
-                    "💻",
-                )
-                .on_hover_text("Follow the system theme");
-                ui.selectable_value(
-                    &mut self.settings.theme_preference,
-                    egui::ThemePreference::Dark,
-                    "🌙",
-                )
-                .on_hover_text("Dark theme");
-                ui.selectable_value(
-                    &mut self.settings.theme_preference,
-                    egui::ThemePreference::Light,
-                    "☀",
-                )
-                .on_hover_text("Light theme");
-                if theme_before != self.settings.theme_preference {
-                    ctx.set_theme(self.settings.theme_preference);
-                    self.clear_render_caches();
-                }
+                    let theme_before = self.settings.theme_preference;
+                    ui.selectable_value(
+                        &mut self.settings.theme_preference,
+                        egui::ThemePreference::System,
+                        "💻",
+                    )
+                    .on_hover_text("Follow the system theme");
+                    ui.selectable_value(
+                        &mut self.settings.theme_preference,
+                        egui::ThemePreference::Dark,
+                        "🌙",
+                    )
+                    .on_hover_text("Dark theme");
+                    ui.selectable_value(
+                        &mut self.settings.theme_preference,
+                        egui::ThemePreference::Light,
+                        "☀",
+                    )
+                    .on_hover_text("Light theme");
+                    if theme_before != self.settings.theme_preference {
+                        ctx.set_theme(self.settings.theme_preference);
+                        self.clear_render_caches();
+                    }
 
-                ui.separator();
+                    ui.separator();
 
-                ui.menu_button("Options", |ui| {
-                    let mut changed = false;
-                    changed |= ui
-                        .checkbox(
-                            &mut self.settings.render_math,
-                            "Render math ($...$ / $$...$$)",
-                        )
-                        .changed();
-                    changed |= ui
-                        .checkbox(&mut self.settings.render_mermaid, "Render Mermaid diagrams")
-                        .changed();
-                    changed |= ui
-                        .checkbox(
-                            &mut self.settings.auto_detect_code_lang,
-                            "Auto-detect code languages",
-                        )
-                        .changed();
-                    changed |= ui
-                        .checkbox(&mut self.settings.autolink_urls, "Autolink plain URLs")
-                        .changed();
-                    changed |= ui
-                        .checkbox(
-                            &mut self.settings.github_links,
-                            "GitHub issue/PR links (#123)",
-                        )
-                        .changed();
-                    changed |= ui
-                        .checkbox(
-                            &mut self.settings.replace_emoji,
-                            "Emoji shortcodes (:smile:)",
-                        )
-                        .changed();
-                    changed |= ui
-                        .checkbox(
-                            &mut self.settings.smart_typography,
-                            "Smart typography (off by default)",
-                        )
-                        .changed();
-                    if changed {
-                        self.rebuild_markdown();
+                    ui.menu_button("Options", |ui| {
+                        let mut changed = false;
+                        changed |= ui
+                            .checkbox(
+                                &mut self.settings.render_math,
+                                "Render math ($...$ / $$...$$)",
+                            )
+                            .changed();
+                        changed |= ui
+                            .checkbox(&mut self.settings.render_mermaid, "Render Mermaid diagrams")
+                            .changed();
+                        changed |= ui
+                            .checkbox(
+                                &mut self.settings.auto_detect_code_lang,
+                                "Auto-detect code languages",
+                            )
+                            .changed();
+                        changed |= ui
+                            .checkbox(&mut self.settings.autolink_urls, "Autolink plain URLs")
+                            .changed();
+                        changed |= ui
+                            .checkbox(
+                                &mut self.settings.github_links,
+                                "GitHub issue/PR links (#123)",
+                            )
+                            .changed();
+                        changed |= ui
+                            .checkbox(
+                                &mut self.settings.replace_emoji,
+                                "Emoji shortcodes (:smile:)",
+                            )
+                            .changed();
+                        changed |= ui
+                            .checkbox(
+                                &mut self.settings.smart_typography,
+                                "Smart typography (off by default)",
+                            )
+                            .changed();
+                        if changed {
+                            self.rebuild_all_markdown();
+                        }
+                    });
+
+                    ui.separator();
+
+                    match self
+                        .active_document()
+                        .and_then(|doc| doc.file_path.as_ref())
+                    {
+                        Some(path) => {
+                            ui.label(path.display().to_string());
+                        }
+                        None => {
+                            ui.weak("No file loaded");
+                        }
                     }
                 });
 
-                ui.separator();
-
-                match &self.file_path {
-                    Some(path) => {
-                        ui.label(path.display().to_string());
-                    }
-                    None => {
-                        ui.weak("No file loaded");
-                    }
-                }
+                ui.add_space(4.0);
+                self.show_tab_bar(ui);
             });
         });
 
@@ -426,15 +589,19 @@ impl eframe::App for MarkdownViewerApp {
                 ui.separator();
             }
 
+            let math_cache = self.math_cache.clone();
+            let math_tx = self.math_tx.clone();
+            let mermaid_cache = self.mermaid_cache.clone();
+            let mermaid_tx = self.mermaid_tx.clone();
+            let render_math_enabled = self.settings.render_math;
+            let render_mermaid_enabled = self.settings.render_mermaid;
+
+            let Some(doc) = self.active_document_mut() else {
+                ui.weak("No documents open");
+                return;
+            };
+
             egui::ScrollArea::vertical().show(ui, |ui| {
-                let math_cache = self.math_cache.clone();
-                let math_tx = self.math_tx.clone();
-                let mermaid_cache = self.mermaid_cache.clone();
-                let mermaid_tx = self.mermaid_tx.clone();
-
-                let render_math_enabled = self.settings.render_math;
-                let render_mermaid_enabled = self.settings.render_mermaid;
-
                 let render_math_fn = move |ui: &mut egui::Ui, tex: &str, inline: bool| {
                     render_math(ui, tex, inline, &math_cache, &math_tx);
                 };
@@ -456,7 +623,7 @@ impl eframe::App for MarkdownViewerApp {
                     viewer = viewer.render_html_fn(Some(&render_html_fn));
                 }
 
-                viewer.show(ui, &mut self.commonmark_cache, &self.markdown);
+                viewer.show(ui, &mut doc.commonmark_cache, &doc.markdown);
             });
         });
     }
