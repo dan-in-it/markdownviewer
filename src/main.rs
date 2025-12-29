@@ -494,32 +494,6 @@ impl eframe::App for MarkdownViewerApp {
 
                     ui.separator();
 
-                    let theme_before = self.settings.theme_preference;
-                    ui.selectable_value(
-                        &mut self.settings.theme_preference,
-                        egui::ThemePreference::System,
-                        "💻",
-                    )
-                    .on_hover_text("Follow the system theme");
-                    ui.selectable_value(
-                        &mut self.settings.theme_preference,
-                        egui::ThemePreference::Dark,
-                        "🌙",
-                    )
-                    .on_hover_text("Dark theme");
-                    ui.selectable_value(
-                        &mut self.settings.theme_preference,
-                        egui::ThemePreference::Light,
-                        "☀",
-                    )
-                    .on_hover_text("Light theme");
-                    if theme_before != self.settings.theme_preference {
-                        ctx.set_theme(self.settings.theme_preference);
-                        self.clear_render_caches();
-                    }
-
-                    ui.separator();
-
                     ui.menu_button("Options", |ui| {
                         let mut changed = false;
                         changed |= ui
@@ -565,17 +539,45 @@ impl eframe::App for MarkdownViewerApp {
 
                     ui.separator();
 
-                    match self
-                        .active_document()
-                        .and_then(|doc| doc.file_path.as_ref())
-                    {
-                        Some(path) => {
-                            ui.label(path.display().to_string());
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let theme_before = self.settings.theme_preference;
+                        ui.selectable_value(
+                            &mut self.settings.theme_preference,
+                            egui::ThemePreference::Light,
+                            "☀",
+                        )
+                        .on_hover_text("Light theme");
+                        ui.selectable_value(
+                            &mut self.settings.theme_preference,
+                            egui::ThemePreference::Dark,
+                            "🌙",
+                        )
+                        .on_hover_text("Dark theme");
+                        ui.selectable_value(
+                            &mut self.settings.theme_preference,
+                            egui::ThemePreference::System,
+                            "💻",
+                        )
+                        .on_hover_text("Follow the system theme");
+                        if theme_before != self.settings.theme_preference {
+                            ctx.set_theme(self.settings.theme_preference);
+                            self.clear_render_caches();
                         }
-                        None => {
-                            ui.weak("No file loaded");
+
+                        ui.separator();
+
+                        match self
+                            .active_document()
+                            .and_then(|doc| doc.file_path.as_ref())
+                        {
+                            Some(path) => {
+                                ui.add(egui::Label::new(path.display().to_string()).truncate());
+                            }
+                            None => {
+                                ui.weak("No file loaded");
+                            }
                         }
-                    }
+                    });
                 });
 
                 ui.add_space(4.0);
