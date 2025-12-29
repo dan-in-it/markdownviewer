@@ -12,6 +12,7 @@ use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
 fn main() -> eframe::Result {
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
+            .with_icon(std::sync::Arc::new(app_icon()))
             .with_inner_size([980.0, 720.0])
             .with_min_inner_size([520.0, 360.0]),
         ..Default::default()
@@ -22,6 +23,159 @@ fn main() -> eframe::Result {
         native_options,
         Box::new(|cc| Ok(Box::new(MarkdownViewerApp::new(cc)))),
     )
+}
+
+fn app_icon() -> egui::IconData {
+    let size: u32 = 64;
+    let mut rgba = vec![0u8; (size * size * 4) as usize];
+
+    let top = (48u8, 44u8, 82u8);
+    let bottom = (18u8, 18u8, 32u8);
+    for y in 0..size {
+        let t = if size > 1 {
+            y as f32 / (size - 1) as f32
+        } else {
+            0.0
+        };
+        let r = lerp_u8(top.0, bottom.0, t);
+        let g = lerp_u8(top.1, bottom.1, t);
+        let b = lerp_u8(top.2, bottom.2, t);
+        for x in 0..size {
+            set_pixel(&mut rgba, size, x as i32, y as i32, r, g, b, 255);
+        }
+    }
+
+    let border = 1i32.max((size as i32) / 64);
+    let border_color = (255u8, 200u8, 80u8, 255u8);
+    fill_rect(&mut rgba, size, 0, 0, size as i32, border, border_color);
+    fill_rect(
+        &mut rgba,
+        size,
+        0,
+        size as i32 - border,
+        size as i32,
+        border,
+        border_color,
+    );
+    fill_rect(&mut rgba, size, 0, 0, border, size as i32, border_color);
+    fill_rect(
+        &mut rgba,
+        size,
+        size as i32 - border,
+        0,
+        border,
+        size as i32,
+        border_color,
+    );
+
+    let pattern_m = [
+        "10001", "11011", "10101", "10001", "10001", "10001", "10001",
+    ];
+    let pattern_d = [
+        "11110", "10001", "10001", "10001", "10001", "10001", "11110",
+    ];
+
+    let scale = 2i32.max((size as i32) / 16);
+    let letter_w = 5 * scale;
+    let letter_h = 7 * scale;
+    let spacing = scale;
+    let total_w = letter_w * 2 + spacing;
+    let x0 = ((size as i32) - total_w) / 2;
+    let y0 = ((size as i32) - letter_h) / 2;
+
+    let shadow = (0u8, 0u8, 0u8, 90u8);
+    draw_glyph(
+        &mut rgba,
+        size,
+        &pattern_m,
+        x0 + border,
+        y0 + border,
+        scale,
+        shadow,
+    );
+    draw_glyph(
+        &mut rgba,
+        size,
+        &pattern_d,
+        x0 + letter_w + spacing + border,
+        y0 + border,
+        scale,
+        shadow,
+    );
+
+    let fg = (245u8, 245u8, 245u8, 255u8);
+    draw_glyph(&mut rgba, size, &pattern_m, x0, y0, scale, fg);
+    draw_glyph(
+        &mut rgba,
+        size,
+        &pattern_d,
+        x0 + letter_w + spacing,
+        y0,
+        scale,
+        fg,
+    );
+
+    egui::IconData {
+        rgba,
+        width: size,
+        height: size,
+    }
+}
+
+fn lerp_u8(a: u8, b: u8, t: f32) -> u8 {
+    let a = a as f32;
+    let b = b as f32;
+    (a * (1.0 - t) + b * t).round().clamp(0.0, 255.0) as u8
+}
+
+fn set_pixel(rgba: &mut [u8], size: u32, x: i32, y: i32, r: u8, g: u8, b: u8, a: u8) {
+    if x < 0 || y < 0 {
+        return;
+    }
+    let (x, y) = (x as u32, y as u32);
+    if x >= size || y >= size {
+        return;
+    }
+    let i = ((y * size + x) * 4) as usize;
+    rgba[i] = r;
+    rgba[i + 1] = g;
+    rgba[i + 2] = b;
+    rgba[i + 3] = a;
+}
+
+fn fill_rect(rgba: &mut [u8], size: u32, x: i32, y: i32, w: i32, h: i32, color: (u8, u8, u8, u8)) {
+    for yy in y..(y + h) {
+        for xx in x..(x + w) {
+            set_pixel(rgba, size, xx, yy, color.0, color.1, color.2, color.3);
+        }
+    }
+}
+
+fn draw_glyph(
+    rgba: &mut [u8],
+    size: u32,
+    pattern: &[&str; 7],
+    x0: i32,
+    y0: i32,
+    scale: i32,
+    color: (u8, u8, u8, u8),
+) {
+    for (yy, row) in pattern.iter().enumerate() {
+        for (xx, ch) in row.as_bytes().iter().copied().enumerate() {
+            if ch != b'1' {
+                continue;
+            }
+            fill_rect(
+                rgba,
+                size,
+                x0 + (xx as i32) * scale,
+                y0 + (yy as i32) * scale,
+                scale,
+                scale,
+                color,
+            );
+        }
+    }
 }
 
 struct MarkdownViewerApp {

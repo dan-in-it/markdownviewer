@@ -2,9 +2,13 @@
 name = "markdownviewer"
 version = "0.1.0"
 edition = "2024"
+build = "build.rs"
 
 [dependencies]
 anyhow = "1.0.100"
 eframe = "0.33.3"
 egui_commonmark = "0.22.0"
 rfd = "0.16.0"
+
+[build-dependencies]
+embed-resource = "3.0.6"

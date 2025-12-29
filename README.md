@@ -29,3 +29,7 @@ Open a file:
 - Or pass a path on startup: `markdownviewer path/to/file.md`
 
 Reload the current file with **Reload**.
+
+## Icon
+
+Replace `assets/icon.ico` and rebuild to change the Windows `.exe` icon.
