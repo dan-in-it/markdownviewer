@@ -10,6 +10,7 @@ A Windows GUI Markdown file viewer written in Rust (built with `eframe`/`egui`).
 - Mermaid diagrams via Kroki (` ```mermaid ` fences → SVG; requires internet)
 - Syntax highlighting + copy buttons (with best-effort language auto-detect)
 - Outline panel + in-document Find (Ctrl+F)
+- In-document heading links (e.g. `[Jump](#my-heading)`)
 - Light/Dark/System theme toggle
 - Emoji shortcodes (`:rocket:`) + URL autolinks + GitHub issue/PR links (`#123`, `PR#123`)
 - Optional smart typography (off by default)
@@ -39,12 +40,16 @@ Build a Windows executable:
 cargo build --release
 ```
 
+Output (native Windows): `target/release/markdownviewer.exe`
+
 Cross-compile a Windows `.exe` from Linux/WSL (requires `cargo-xwin`):
 
 ```bash
 cargo install cargo-xwin
 cargo xwin build --target x86_64-pc-windows-msvc --release
 ```
+
+Output (cross-compile): `target/x86_64-pc-windows-msvc/release/markdownviewer.exe`
 
 Notes:
 

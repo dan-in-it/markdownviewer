@@ -141,6 +141,22 @@ fn lerp_u8(a: u8, b: u8, t: f32) -> u8 {
     (a * (1.0 - t) + b * t).round().clamp(0.0, 255.0) as u8
 }
 
+fn lerp_color(a: egui::Color32, b: egui::Color32, t: f32) -> egui::Color32 {
+    let [ar, ag, ab, aa] = a.to_srgba_unmultiplied();
+    let [br, bg, bb, ba] = b.to_srgba_unmultiplied();
+    egui::Color32::from_rgba_unmultiplied(
+        lerp_u8(ar, br, t),
+        lerp_u8(ag, bg, t),
+        lerp_u8(ab, bb, t),
+        lerp_u8(aa, ba, t),
+    )
+}
+
+fn with_alpha(color: egui::Color32, alpha: u8) -> egui::Color32 {
+    let [r, g, b, _] = color.to_srgba_unmultiplied();
+    egui::Color32::from_rgba_unmultiplied(r, g, b, alpha)
+}
+
 fn set_pixel(rgba: &mut [u8], size: u32, x: i32, y: i32, r: u8, g: u8, b: u8, a: u8) {
     if x < 0 || y < 0 {
         return;
@@ -214,12 +230,117 @@ struct MermaidKey {
 struct OutlineItem {
     level: usize,
     title: String,
+    slug: String,
     line: usize,
+}
+
+fn slugify_heading(title: &str) -> String {
+    let mut out = String::with_capacity(title.len());
+    let mut pending_dash = false;
+
+    for ch in title.chars() {
+        if ch.is_alphanumeric() {
+            if pending_dash && !out.is_empty() {
+                out.push('-');
+            }
+            pending_dash = false;
+            for lower in ch.to_lowercase() {
+                out.push(lower);
+            }
+            continue;
+        }
+
+        if ch.is_whitespace() || ch == '-' || ch == '_' {
+            pending_dash = true;
+        }
+    }
+
+    while out.ends_with('-') {
+        out.pop();
+    }
+
+    out
+}
+
+fn hex_val(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn percent_decode(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut idx = 0usize;
+
+    while idx < bytes.len() {
+        match bytes[idx] {
+            b'%' if idx + 2 < bytes.len() => {
+                let Some(hi) = hex_val(bytes[idx + 1]) else {
+                    out.push(bytes[idx]);
+                    idx += 1;
+                    continue;
+                };
+                let Some(lo) = hex_val(bytes[idx + 2]) else {
+                    out.push(bytes[idx]);
+                    idx += 1;
+                    continue;
+                };
+                out.push((hi << 4) | lo);
+                idx += 3;
+            }
+            b'+' => {
+                out.push(b' ');
+                idx += 1;
+            }
+            other => {
+                out.push(other);
+                idx += 1;
+            }
+        }
+    }
+
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn unique_slug(base: &str, used: &mut HashSet<String>) -> String {
+    if used.insert(base.to_string()) {
+        return base.to_string();
+    }
+    for idx in 1usize.. {
+        let candidate = format!("{base}-{idx}");
+        if used.insert(candidate.clone()) {
+            return candidate;
+        }
+    }
+    unreachable!("infinite loop should always find a unique slug")
+}
+
+fn push_outline_item(
+    outline: &mut Vec<OutlineItem>,
+    used_slugs: &mut HashSet<String>,
+    level: usize,
+    title: String,
+    line: usize,
+) {
+    let base = slugify_heading(&title);
+    let base = if base.is_empty() { "section".to_string() } else { base };
+    let slug = unique_slug(&base, used_slugs);
+    outline.push(OutlineItem {
+        level,
+        title,
+        slug,
+        line,
+    });
 }
 
 fn build_outline(markdown: &str) -> Vec<OutlineItem> {
     let lines: Vec<&str> = markdown.lines().collect();
     let mut outline = Vec::new();
+    let mut used_slugs = HashSet::<String>::new();
 
     for (idx, line) in lines.iter().enumerate() {
         let line = line.trim_end_matches(['\r']);
@@ -235,11 +356,7 @@ fn build_outline(markdown: &str) -> Vec<OutlineItem> {
                     .trim()
                     .to_string();
                 if !title.is_empty() {
-                    outline.push(OutlineItem {
-                        level: hash_count,
-                        title,
-                        line: idx,
-                    });
+                    push_outline_item(&mut outline, &mut used_slugs, hash_count, title, idx);
                 }
             }
             continue;
@@ -251,11 +368,13 @@ fn build_outline(markdown: &str) -> Vec<OutlineItem> {
         if (is_h1 || is_h2) && idx > 0 {
             let prev = lines[idx - 1].trim();
             if !prev.is_empty() {
-                outline.push(OutlineItem {
-                    level: if is_h1 { 1 } else { 2 },
-                    title: prev.to_string(),
-                    line: idx - 1,
-                });
+                push_outline_item(
+                    &mut outline,
+                    &mut used_slugs,
+                    if is_h1 { 1 } else { 2 },
+                    prev.to_string(),
+                    idx - 1,
+                );
             }
         }
     }
@@ -389,6 +508,41 @@ impl Document {
     fn tooltip(&self) -> Option<String> {
         self.file_path.as_ref().map(|p| p.display().to_string())
     }
+
+    fn heading_line_for_fragment(&self, fragment: &str) -> Option<usize> {
+        let fragment = fragment.trim();
+        if fragment.is_empty() {
+            return Some(0);
+        }
+
+        let decoded = percent_decode(fragment).trim().to_string();
+        if decoded.is_empty() {
+            return Some(0);
+        }
+
+        let decoded = decoded
+            .strip_prefix("user-content-")
+            .unwrap_or(decoded.as_str())
+            .trim();
+        if decoded.is_empty() {
+            return Some(0);
+        }
+
+        let decoded_lc = decoded.to_lowercase();
+        if let Some(item) = self.outline.iter().find(|item| item.slug == decoded_lc) {
+            return Some(item.line);
+        }
+
+        let slug = slugify_heading(decoded);
+        if slug.is_empty() {
+            return None;
+        }
+
+        self.outline
+            .iter()
+            .find(|item| item.slug == slug)
+            .map(|item| item.line)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -520,7 +674,7 @@ impl MarkdownViewerApp {
             error: None,
         };
 
-        cc.egui_ctx.set_theme(app.settings.theme_preference);
+        apply_app_theme(&cc.egui_ctx, app.settings.theme);
 
         let startup_paths: Vec<PathBuf> = std::env::args_os().skip(1).map(PathBuf::from).collect();
         if !startup_paths.is_empty() {
@@ -918,6 +1072,35 @@ impl MarkdownViewerApp {
             self.close_tab(idx);
         }
     }
+
+    fn handle_internal_anchor_links(&mut self, ctx: &egui::Context) {
+        let mut fragments = Vec::<String>::new();
+        ctx.output_mut(|o| {
+            o.commands.retain(|cmd| {
+                let egui::OutputCommand::OpenUrl(open) = cmd else {
+                    return true;
+                };
+                let Some(fragment) = open.url.strip_prefix('#') else {
+                    return true;
+                };
+                fragments.push(fragment.to_string());
+                false
+            });
+        });
+
+        let Some(fragment) = fragments.pop() else {
+            return;
+        };
+        let Some(doc) = self.active_document_mut() else {
+            return;
+        };
+        let Some(line) = doc.heading_line_for_fragment(&fragment) else {
+            return;
+        };
+
+        doc.scroll_to_line = Some(line);
+        ctx.request_repaint();
+    }
 }
 
 impl eframe::App for MarkdownViewerApp {
@@ -1058,27 +1241,43 @@ impl eframe::App for MarkdownViewerApp {
                     ui.separator();
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let theme_before = self.settings.theme_preference;
+                        let theme_before = self.settings.theme;
                         ui.selectable_value(
-                            &mut self.settings.theme_preference,
-                            egui::ThemePreference::Light,
+                            &mut self.settings.theme,
+                            AppTheme::TerminalAmber,
+                            egui::RichText::new("A>").monospace().color(egui::Color32::from_rgb(
+                                0xff, 0xb0, 0x36,
+                            )),
+                        )
+                        .on_hover_text("Amber terminal theme");
+                        ui.selectable_value(
+                            &mut self.settings.theme,
+                            AppTheme::TerminalGreen,
+                            egui::RichText::new("G>").monospace().color(egui::Color32::from_rgb(
+                                0x00, 0xff, 0x7a,
+                            )),
+                        )
+                        .on_hover_text("Green terminal theme");
+                        ui.selectable_value(
+                            &mut self.settings.theme,
+                            AppTheme::Light,
                             "☀",
                         )
                         .on_hover_text("Light theme");
                         ui.selectable_value(
-                            &mut self.settings.theme_preference,
-                            egui::ThemePreference::Dark,
+                            &mut self.settings.theme,
+                            AppTheme::Dark,
                             "🌙",
                         )
                         .on_hover_text("Dark theme");
                         ui.selectable_value(
-                            &mut self.settings.theme_preference,
-                            egui::ThemePreference::System,
+                            &mut self.settings.theme,
+                            AppTheme::System,
                             "💻",
                         )
                         .on_hover_text("Follow the system theme");
-                        if theme_before != self.settings.theme_preference {
-                            ctx.set_theme(self.settings.theme_preference);
+                        if theme_before != self.settings.theme {
+                            apply_app_theme(ctx, self.settings.theme);
                             self.clear_render_caches();
                         }
 
@@ -1140,7 +1339,7 @@ impl eframe::App for MarkdownViewerApp {
                                 ui.add_space(((item.level.saturating_sub(1)) as f32) * 12.0);
                                 if ui
                                     .selectable_label(false, &item.title)
-                                    .on_hover_text(format!("Line {}", item.line + 1))
+                                    .on_hover_text(format!("Line {}\n#{}", item.line + 1, item.slug))
                                     .clicked()
                                 {
                                     jump_to_line = Some(item.line);
@@ -1208,6 +1407,7 @@ impl eframe::App for MarkdownViewerApp {
         });
 
         self.show_find_window(ctx);
+        self.handle_internal_anchor_links(ctx);
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
@@ -1226,6 +1426,101 @@ impl eframe::App for MarkdownViewerApp {
 
 fn normalize_path(path: PathBuf) -> PathBuf {
     std::fs::canonicalize(&path).unwrap_or(path)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+enum AppTheme {
+    System,
+    Dark,
+    Light,
+    TerminalGreen,
+    TerminalAmber,
+}
+
+impl Default for AppTheme {
+    fn default() -> Self {
+        Self::System
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum TerminalHue {
+    Green,
+    Amber,
+}
+
+fn apply_app_theme(ctx: &egui::Context, theme: AppTheme) {
+    match theme {
+        AppTheme::System => ctx.set_theme(egui::ThemePreference::System),
+        AppTheme::Dark => ctx.set_theme(egui::ThemePreference::Dark),
+        AppTheme::Light => ctx.set_theme(egui::ThemePreference::Light),
+        AppTheme::TerminalGreen => ctx.set_visuals(terminal_visuals(TerminalHue::Green)),
+        AppTheme::TerminalAmber => ctx.set_visuals(terminal_visuals(TerminalHue::Amber)),
+    }
+}
+
+fn terminal_visuals(hue: TerminalHue) -> egui::Visuals {
+    let mut visuals = egui::Visuals::dark();
+
+    let bg = egui::Color32::from_rgb(0x07, 0x0b, 0x07);
+    let extreme_bg = egui::Color32::from_rgb(0x04, 0x06, 0x04);
+
+    let (accent, accent_dim, accent_bright) = match hue {
+        TerminalHue::Green => (
+            egui::Color32::from_rgb(0x00, 0xff, 0x7a),
+            egui::Color32::from_rgb(0x00, 0xc8, 0x60),
+            egui::Color32::from_rgb(0xc8, 0xff, 0xe8),
+        ),
+        TerminalHue::Amber => (
+            egui::Color32::from_rgb(0xff, 0xb0, 0x36),
+            egui::Color32::from_rgb(0xe6, 0x9a, 0x20),
+            egui::Color32::from_rgb(0xff, 0xf0, 0xd0),
+        ),
+    };
+
+    let button_bg = lerp_color(bg, accent, 0.12);
+    let hovered_bg = lerp_color(bg, accent, 0.18);
+    let active_bg = lerp_color(bg, accent, 0.24);
+
+    visuals.window_fill = bg;
+    visuals.panel_fill = bg;
+    visuals.window_stroke = egui::Stroke::new(1.0, with_alpha(accent_dim, 140));
+    visuals.faint_bg_color = lerp_color(bg, accent_dim, 0.06);
+    visuals.extreme_bg_color = extreme_bg;
+    visuals.text_edit_bg_color = Some(extreme_bg);
+    visuals.code_bg_color = lerp_color(bg, accent, 0.08);
+    visuals.hyperlink_color = egui::Color32::from_rgb(0x66, 0xd9, 0xef); // cyan
+    visuals.selection.bg_fill = lerp_color(bg, accent, 0.35);
+    visuals.selection.stroke = egui::Stroke::new(1.0, accent_bright);
+
+    visuals.widgets.noninteractive.bg_fill = bg;
+    visuals.widgets.noninteractive.weak_bg_fill = bg;
+    visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, with_alpha(accent_dim, 140));
+    visuals.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0, accent);
+
+    visuals.widgets.inactive.weak_bg_fill = button_bg;
+    visuals.widgets.inactive.bg_fill = button_bg;
+    visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, with_alpha(accent_dim, 110));
+    visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, accent);
+
+    visuals.widgets.hovered.weak_bg_fill = hovered_bg;
+    visuals.widgets.hovered.bg_fill = hovered_bg;
+    visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, with_alpha(accent_bright, 200));
+    visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.5, accent_bright);
+
+    visuals.widgets.active.weak_bg_fill = active_bg;
+    visuals.widgets.active.bg_fill = active_bg;
+    visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0, accent_bright);
+    visuals.widgets.active.fg_stroke = egui::Stroke::new(2.0, accent_bright);
+
+    visuals.widgets.open.weak_bg_fill = hovered_bg;
+    visuals.widgets.open.bg_fill = bg;
+    visuals.widgets.open.bg_stroke = egui::Stroke::new(1.0, with_alpha(accent_dim, 140));
+    visuals.widgets.open.fg_stroke = egui::Stroke::new(1.0, accent_bright);
+
+    visuals.warn_fg_color = egui::Color32::from_rgb(0xff, 0xb0, 0x36);
+
+    visuals
 }
 
 fn read_markdown(path: &Path) -> Result<String> {
@@ -1324,7 +1619,7 @@ fn parse_github_remote(remote: &str) -> Option<String> {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 struct ViewerSettings {
-    theme_preference: egui::ThemePreference,
+    theme: AppTheme,
     render_math: bool,
     render_mermaid: bool,
     auto_detect_code_lang: bool,
@@ -1339,7 +1634,7 @@ struct ViewerSettings {
 impl Default for ViewerSettings {
     fn default() -> Self {
         Self {
-            theme_preference: egui::ThemePreference::System,
+            theme: AppTheme::System,
             render_math: true,
             render_mermaid: true,
             auto_detect_code_lang: true,
