@@ -1,19 +1,21 @@
 [package]
 name = "markdownviewer"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 build = "build.rs"
 
 [dependencies]
 anyhow = "1.0.100"
-eframe = "0.33.3"
+eframe = { version = "0.33.3", features = ["persistence"] }
 egui_commonmark = { version = "0.22.0", features = ["better_syntax_highlighting", "svg"] }
 emojis = "0.8.0"
 linkify = "0.10.0"
 mathjax_svg = "3.2.0"
+notify = "8.2.0"
 regex = "1.11.1"
 reqwest = { version = "0.12.12", default-features = false, features = ["blocking", "rustls-tls"] }
 rfd = "0.16.0"
+serde = { version = "1.0.228", features = ["derive"] }
 
 [build-dependencies]
 embed-resource = "3.0.6"

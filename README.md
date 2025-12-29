@@ -9,9 +9,11 @@ A Windows GUI Markdown file viewer written in Rust (built with `eframe`/`egui`).
 - Math rendering (`$...$` / `$$...$$`) via MathJax → SVG
 - Mermaid diagrams via Kroki (` ```mermaid ` fences → SVG; requires internet)
 - Syntax highlighting + copy buttons (with best-effort language auto-detect)
+- Outline panel + in-document Find (Ctrl+F)
 - Light/Dark/System theme toggle
 - Emoji shortcodes (`:rocket:`) + URL autolinks + GitHub issue/PR links (`#123`, `PR#123`)
 - Optional smart typography (off by default)
+- Recent files + session restore, optional auto-reload on file changes
 
 ## Usage
 
@@ -47,6 +49,7 @@ Notes:
 Open a file:
 
 - Click **Open…**
+- You can select multiple files to open them as tabs
 - Or drag and drop a `.md` file onto the window
 - Or pass a path on startup: `markdownviewer path/to/file.md`
 

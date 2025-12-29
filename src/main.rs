@@ -6,13 +6,21 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex, OnceLock, mpsc};
-use std::{collections::HashMap, thread};
+use std::{
+    collections::{HashMap, HashSet},
+    thread,
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context as _, Result};
 use eframe::egui;
 use eframe::egui::TextStyle;
 use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
 use regex::{Captures, Regex};
+use serde::{Deserialize, Serialize};
+
+const STATE_KEY: &str = "markdownviewer_state_v1";
+const MAX_RECENT_FILES: usize = 20;
 
 fn main() -> eframe::Result {
     let native_options = eframe::NativeOptions {
@@ -202,28 +210,137 @@ struct MermaidKey {
     source: String,
 }
 
+#[derive(Debug, Clone)]
+struct OutlineItem {
+    level: usize,
+    title: String,
+    line: usize,
+}
+
+fn build_outline(markdown: &str) -> Vec<OutlineItem> {
+    let lines: Vec<&str> = markdown.lines().collect();
+    let mut outline = Vec::new();
+
+    for (idx, line) in lines.iter().enumerate() {
+        let line = line.trim_end_matches(['\r']);
+        let trimmed = line.trim_start_matches([' ', '\t']);
+
+        let hash_count = trimmed.chars().take_while(|c| *c == '#').count();
+        if (1..=6).contains(&hash_count) {
+            let after_hashes = &trimmed[hash_count..];
+            if after_hashes.starts_with([' ', '\t']) {
+                let title = after_hashes
+                    .trim()
+                    .trim_end_matches('#')
+                    .trim()
+                    .to_string();
+                if !title.is_empty() {
+                    outline.push(OutlineItem {
+                        level: hash_count,
+                        title,
+                        line: idx,
+                    });
+                }
+            }
+            continue;
+        }
+
+        let underline = trimmed.trim();
+        let is_h1 = !underline.is_empty() && underline.chars().all(|c| c == '=');
+        let is_h2 = !underline.is_empty() && underline.chars().all(|c| c == '-');
+        if (is_h1 || is_h2) && idx > 0 {
+            let prev = lines[idx - 1].trim();
+            if !prev.is_empty() {
+                outline.push(OutlineItem {
+                    level: if is_h1 { 1 } else { 2 },
+                    title: prev.to_string(),
+                    line: idx - 1,
+                });
+            }
+        }
+    }
+
+    outline
+}
+
+#[derive(Debug)]
+enum WatchCommand {
+    SetWatchedFiles(Vec<PathBuf>),
+}
+
+fn spawn_file_watcher(ctx: egui::Context, rx: mpsc::Receiver<WatchCommand>, tx: mpsc::Sender<PathBuf>) {
+    thread::spawn(move || {
+        use notify::Watcher as _;
+
+        let event_tx = tx.clone();
+        let repaint_ctx = ctx.clone();
+        let mut watcher = match notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+            let Ok(event) = res else {
+                return;
+            };
+            for path in event.paths {
+                let _ = event_tx.send(path);
+            }
+            repaint_ctx.request_repaint();
+        }) {
+            Ok(watcher) => watcher,
+            Err(err) => {
+                eprintln!("file watcher disabled: {err}");
+                return;
+            }
+        };
+
+        let mut watched_dirs = HashSet::<PathBuf>::new();
+        while let Ok(cmd) = rx.recv() {
+            match cmd {
+                WatchCommand::SetWatchedFiles(files) => {
+                    let mut next_dirs = HashSet::<PathBuf>::new();
+                    for file in files {
+                        if let Some(parent) = file.parent() {
+                            next_dirs.insert(parent.to_path_buf());
+                        }
+                    }
+
+                    for dir in watched_dirs.difference(&next_dirs) {
+                        let _ = watcher.unwatch(dir);
+                    }
+                    for dir in next_dirs.difference(&watched_dirs) {
+                        let _ = watcher.watch(dir, notify::RecursiveMode::NonRecursive);
+                    }
+
+                    watched_dirs = next_dirs;
+                }
+            }
+        }
+    });
+}
+
 struct Document {
+    id: u64,
     raw_markdown: String,
     markdown: String,
     file_path: Option<PathBuf>,
     github_repo: Option<GithubRepo>,
+    outline: Vec<OutlineItem>,
+    scroll_to_line: Option<usize>,
     commonmark_cache: CommonMarkCache,
 }
 
 impl Document {
-    fn welcome(settings: &ViewerSettings) -> Self {
+    fn welcome(id: u64, settings: &ViewerSettings) -> Self {
         let raw_markdown = String::from(
             "# markdownviewer\n\nOpen a `.md` file to view it.\n\n- Use **Open…** or drag and drop a file.\n- Use **Reload** to re-read the current file.\n",
         );
-        Self::from_content(raw_markdown, None, settings)
+        Self::from_content(id, raw_markdown, None, settings)
     }
 
-    fn from_path(path: PathBuf, settings: &ViewerSettings) -> Result<Self> {
+    fn from_path(id: u64, path: PathBuf, settings: &ViewerSettings) -> Result<Self> {
         let raw_markdown = read_markdown(&path)?;
-        Ok(Self::from_content(raw_markdown, Some(path), settings))
+        Ok(Self::from_content(id, raw_markdown, Some(path), settings))
     }
 
     fn from_content(
+        id: u64,
         raw_markdown: String,
         file_path: Option<PathBuf>,
         settings: &ViewerSettings,
@@ -231,10 +348,13 @@ impl Document {
         let github_repo = file_path.as_deref().and_then(|p| discover_github_repo(p));
 
         let mut doc = Self {
+            id,
             raw_markdown,
             markdown: String::new(),
             file_path,
             github_repo,
+            outline: Vec::new(),
+            scroll_to_line: None,
             commonmark_cache: CommonMarkCache::default(),
         };
         doc.rebuild_markdown(settings);
@@ -244,6 +364,7 @@ impl Document {
     fn rebuild_markdown(&mut self, settings: &ViewerSettings) {
         self.markdown =
             preprocess_markdown(&self.raw_markdown, settings, self.github_repo.as_ref());
+        self.outline = build_outline(&self.raw_markdown);
         self.commonmark_cache = CommonMarkCache::default();
     }
 
@@ -270,10 +391,84 @@ impl Document {
     }
 }
 
+#[derive(Debug, Clone)]
+struct FindMatch {
+    line: usize,
+    col: usize,
+    preview: String,
+}
+
+#[derive(Debug, Default)]
+struct FindState {
+    open: bool,
+    focus_query: bool,
+    query: String,
+    case_sensitive: bool,
+    matches: Vec<FindMatch>,
+    selected: usize,
+    last_doc_id: Option<u64>,
+    last_query: String,
+    last_case_sensitive: bool,
+}
+
+fn find_matches(text: &str, query: &str, case_sensitive: bool) -> Vec<FindMatch> {
+    const MAX_MATCHES: usize = 500;
+    if query.is_empty() {
+        return Vec::new();
+    }
+
+    let mut matches = Vec::new();
+    let query_cmp = if case_sensitive {
+        query.to_string()
+    } else {
+        query.to_lowercase()
+    };
+
+    for (line_no, line) in text.lines().enumerate() {
+        let hay = if case_sensitive {
+            line.to_string()
+        } else {
+            line.to_lowercase()
+        };
+
+        let mut start = 0usize;
+        while start <= hay.len() {
+            let Some(rel) = hay[start..].find(&query_cmp) else {
+                break;
+            };
+            let col = start + rel;
+            let mut preview = line.trim().to_string();
+            if preview.len() > 180 {
+                preview.truncate(180);
+                preview.push('…');
+            }
+
+            matches.push(FindMatch {
+                line: line_no,
+                col,
+                preview,
+            });
+            if matches.len() >= MAX_MATCHES {
+                return matches;
+            }
+
+            start = col + query_cmp.len().max(1);
+        }
+    }
+
+    matches
+}
+
 struct MarkdownViewerApp {
     documents: Vec<Document>,
     active_doc: usize,
     settings: ViewerSettings,
+    persisted: PersistedState,
+    next_doc_id: u64,
+    find: FindState,
+    watch_cmd_tx: mpsc::Sender<WatchCommand>,
+    watch_event_rx: mpsc::Receiver<PathBuf>,
+    pending_reloads: HashMap<PathBuf, Instant>,
     math_cache: Arc<Mutex<HashMap<MathKey, SvgState>>>,
     math_tx: mpsc::Sender<MathKey>,
     mermaid_cache: Arc<Mutex<HashMap<MermaidKey, SvgState>>>,
@@ -287,6 +482,12 @@ impl MarkdownViewerApp {
             style.url_in_tooltip = true;
         });
 
+        let persisted: PersistedState = cc
+            .storage
+            .and_then(|storage| eframe::get_value(storage, STATE_KEY))
+            .unwrap_or_default();
+        let settings = persisted.settings.clone();
+
         let math_cache: Arc<Mutex<HashMap<MathKey, SvgState>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let mermaid_cache: Arc<Mutex<HashMap<MermaidKey, SvgState>>> =
@@ -298,10 +499,20 @@ impl MarkdownViewerApp {
         spawn_math_worker(cc.egui_ctx.clone(), math_cache.clone(), math_rx);
         spawn_mermaid_worker(cc.egui_ctx.clone(), mermaid_cache.clone(), mermaid_rx);
 
+        let (watch_cmd_tx, watch_cmd_rx) = mpsc::channel::<WatchCommand>();
+        let (watch_event_tx, watch_event_rx) = mpsc::channel::<PathBuf>();
+        spawn_file_watcher(cc.egui_ctx.clone(), watch_cmd_rx, watch_event_tx);
+
         let mut app = Self {
-            documents: vec![Document::welcome(&ViewerSettings::default())],
+            documents: Vec::new(),
             active_doc: 0,
-            settings: ViewerSettings::default(),
+            settings,
+            persisted,
+            next_doc_id: 1,
+            find: FindState::default(),
+            watch_cmd_tx,
+            watch_event_rx,
+            pending_reloads: HashMap::new(),
             math_cache,
             math_tx,
             mermaid_cache,
@@ -311,11 +522,240 @@ impl MarkdownViewerApp {
 
         cc.egui_ctx.set_theme(app.settings.theme_preference);
 
-        if let Some(path) = std::env::args_os().nth(1).map(PathBuf::from) {
-            let _ = app.open_file(path);
+        let startup_paths: Vec<PathBuf> = std::env::args_os().skip(1).map(PathBuf::from).collect();
+        if !startup_paths.is_empty() {
+            for path in startup_paths {
+                let _ = app.open_file(path);
+            }
+        } else {
+            let open_files = app.persisted.open_files.clone();
+            for path in open_files {
+                let _ = app.open_file(path);
+            }
+            if let Some(active_path) = app.persisted.active_file.clone() {
+                if let Some(idx) = app
+                    .documents
+                    .iter()
+                    .position(|doc| doc.file_path.as_ref() == Some(&active_path))
+                {
+                    app.active_doc = idx;
+                }
+            }
         }
 
+        if app.documents.is_empty() {
+            let id = app.alloc_doc_id();
+            app.documents.push(Document::welcome(id, &app.settings));
+            app.active_doc = 0;
+        }
+
+        app.update_watched_paths();
+
         app
+    }
+
+    fn alloc_doc_id(&mut self) -> u64 {
+        let id = self.next_doc_id;
+        self.next_doc_id = self.next_doc_id.saturating_add(1);
+        id
+    }
+
+    fn refresh_find_cache(&mut self) {
+        let Some(doc) = self.active_document() else {
+            self.find.matches.clear();
+            self.find.selected = 0;
+            self.find.last_doc_id = None;
+            return;
+        };
+
+        let doc_id = doc.id;
+        if self.find.last_doc_id != Some(doc_id)
+            || self.find.last_query != self.find.query
+            || self.find.last_case_sensitive != self.find.case_sensitive
+        {
+            self.find.matches = find_matches(&doc.raw_markdown, &self.find.query, self.find.case_sensitive);
+            self.find.selected = 0;
+            self.find.last_doc_id = Some(doc_id);
+            self.find.last_query = self.find.query.clone();
+            self.find.last_case_sensitive = self.find.case_sensitive;
+        }
+
+        if !self.find.matches.is_empty() && self.find.selected >= self.find.matches.len() {
+            self.find.selected = self.find.matches.len() - 1;
+        }
+    }
+
+    fn find_next(&mut self) {
+        self.refresh_find_cache();
+        if self.find.matches.is_empty() {
+            return;
+        }
+        self.find.selected = (self.find.selected + 1) % self.find.matches.len();
+        self.jump_to_find_selected();
+    }
+
+    fn find_prev(&mut self) {
+        self.refresh_find_cache();
+        if self.find.matches.is_empty() {
+            return;
+        }
+        if self.find.selected == 0 {
+            self.find.selected = self.find.matches.len() - 1;
+        } else {
+            self.find.selected -= 1;
+        }
+        self.jump_to_find_selected();
+    }
+
+    fn jump_to_find_selected(&mut self) {
+        let Some(line) = self.find.matches.get(self.find.selected).map(|m| m.line) else {
+            return;
+        };
+        if let Some(doc) = self.active_document_mut() {
+            doc.scroll_to_line = Some(line);
+        }
+    }
+
+    fn show_find_window(&mut self, ctx: &egui::Context) {
+        if !self.find.open {
+            return;
+        }
+
+        self.refresh_find_cache();
+        let matches = self.find.matches.clone();
+        let selected = self.find.selected;
+
+        let mut jump_to_line = None::<usize>;
+        let mut do_next = false;
+        let mut do_prev = false;
+
+        egui::Window::new("Find")
+            .open(&mut self.find.open)
+            .resizable(false)
+            .collapsible(false)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    let resp = ui.text_edit_singleline(&mut self.find.query);
+                    if self.find.focus_query {
+                        resp.request_focus();
+                        self.find.focus_query = false;
+                    }
+
+                    if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        do_next = true;
+                    }
+
+                    if ui.checkbox(&mut self.find.case_sensitive, "Aa").changed() {
+                        // Updated below after the window closes.
+                    }
+
+                    if ui.button("Prev").clicked() {
+                        do_prev = true;
+                    }
+                    if ui.button("Next").clicked() {
+                        do_next = true;
+                    }
+                });
+
+                if self.find.query.is_empty() {
+                    ui.weak("Type to search…");
+                } else {
+                    ui.label(format!(
+                        "{} match{}",
+                        matches.len(),
+                        if matches.len() == 1 { "" } else { "es" }
+                    ));
+                }
+
+                egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
+                    for (idx, m) in matches.iter().enumerate() {
+                        let label = format!("{}:{}  {}", m.line + 1, m.col + 1, m.preview);
+                        if ui.selectable_label(idx == selected, label).clicked() {
+                            self.find.selected = idx;
+                            jump_to_line = Some(m.line);
+                        }
+                    }
+                });
+            });
+
+        // Update cached results for changes made in the find window this frame.
+        self.refresh_find_cache();
+
+        if let Some(line) = jump_to_line {
+            if let Some(doc) = self.active_document_mut() {
+                doc.scroll_to_line = Some(line);
+            }
+        }
+        if do_prev {
+            self.find_prev();
+        } else if do_next {
+            self.find_next();
+        }
+    }
+
+    fn update_watched_paths(&mut self) {
+        if !self.settings.auto_reload {
+            self.pending_reloads.clear();
+            let _ = self
+                .watch_cmd_tx
+                .send(WatchCommand::SetWatchedFiles(Vec::new()));
+            return;
+        }
+
+        let files: Vec<PathBuf> = self
+            .documents
+            .iter()
+            .filter_map(|doc| doc.file_path.clone())
+            .collect();
+        let _ = self.watch_cmd_tx.send(WatchCommand::SetWatchedFiles(files));
+    }
+
+    fn pump_watch_events(&mut self) {
+        while let Ok(path) = self.watch_event_rx.try_recv() {
+            let normalized = normalize_path(path.clone());
+            for doc_path in self.documents.iter().filter_map(|doc| doc.file_path.clone()) {
+                if doc_path == path || doc_path == normalized {
+                    self.pending_reloads.insert(doc_path, Instant::now());
+                }
+            }
+        }
+    }
+
+    fn process_pending_reloads(&mut self) {
+        const DEBOUNCE: Duration = Duration::from_millis(250);
+        let now = Instant::now();
+
+        let ready: Vec<PathBuf> = self
+            .pending_reloads
+            .iter()
+            .filter_map(|(path, last_change)| {
+                if now.duration_since(*last_change) >= DEBOUNCE {
+                    Some(path.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        for path in ready {
+            self.pending_reloads.remove(&path);
+            self.reload_open_file_silently(&path);
+        }
+    }
+
+    fn reload_open_file_silently(&mut self, path: &Path) {
+        let settings = self.settings.clone();
+        let Some(idx) = self
+            .documents
+            .iter()
+            .position(|doc| doc.file_path.as_deref() == Some(path))
+        else {
+            return;
+        };
+
+        if self.documents[idx].reload(&settings).is_ok() && idx == self.active_doc {
+            self.error = None;
+        }
     }
 
     fn open_dialog(&mut self) {
@@ -328,12 +768,15 @@ impl MarkdownViewerApp {
                 dialog = dialog.set_directory(parent);
             }
         }
-        if let Some(path) = dialog.pick_file() {
-            let _ = self.open_file(path);
+        if let Some(paths) = dialog.pick_files() {
+            for path in paths {
+                let _ = self.open_file(path);
+            }
         }
     }
 
     fn open_file(&mut self, path: PathBuf) -> Result<()> {
+        let path = normalize_path(path);
         if let Some(idx) = self
             .documents
             .iter()
@@ -344,15 +787,21 @@ impl MarkdownViewerApp {
                 self.error = Some(err.to_string());
             } else {
                 self.error = None;
+                self.persisted.remember_file(path);
+                self.update_watched_paths();
             }
             return Ok(());
         }
 
-        match Document::from_path(path, &self.settings) {
+        match Document::from_path(self.alloc_doc_id(), path, &self.settings) {
             Ok(doc) => {
                 self.documents.push(doc);
                 self.active_doc = self.documents.len().saturating_sub(1);
                 self.error = None;
+                if let Some(path) = self.documents[self.active_doc].file_path.clone() {
+                    self.persisted.remember_file(path);
+                }
+                self.update_watched_paths();
             }
             Err(err) => {
                 self.error = Some(err.to_string());
@@ -405,11 +854,13 @@ impl MarkdownViewerApp {
         }
         self.documents.remove(idx);
         if self.documents.is_empty() {
-            self.documents.push(Document::welcome(&self.settings));
+            let id = self.alloc_doc_id();
+            self.documents.push(Document::welcome(id, &self.settings));
             self.active_doc = 0;
         } else if self.active_doc >= self.documents.len() {
             self.active_doc = self.documents.len() - 1;
         }
+        self.update_watched_paths();
     }
 
     fn show_tab_bar(&mut self, ui: &mut egui::Ui) {
@@ -471,8 +922,31 @@ impl MarkdownViewerApp {
 
 impl eframe::App for MarkdownViewerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        if let Some(path) = ctx.input(|i| i.raw.dropped_files.iter().find_map(|f| f.path.clone())) {
+        let dropped_paths: Vec<PathBuf> = ctx.input(|i| {
+            i.raw
+                .dropped_files
+                .iter()
+                .filter_map(|f| f.path.clone())
+                .collect()
+        });
+        for path in dropped_paths {
             let _ = self.open_file(path);
+        }
+
+        if ctx.input(|i| i.key_pressed(egui::Key::F) && i.modifiers.command) {
+            self.find.open = true;
+            self.find.focus_query = true;
+        }
+        if self.find.open && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.find.open = false;
+        }
+
+        if self.settings.auto_reload {
+            self.pump_watch_events();
+            self.process_pending_reloads();
+        } else {
+            while self.watch_event_rx.try_recv().is_ok() {}
+            self.pending_reloads.clear();
         }
 
         egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
@@ -481,6 +955,36 @@ impl eframe::App for MarkdownViewerApp {
                     if ui.button("Open…").clicked() {
                         self.open_dialog();
                     }
+                    ui.menu_button("Recent", |ui| {
+                        let recent = self.persisted.recent_files.clone();
+                        if recent.is_empty() {
+                            ui.weak("No recent files");
+                            return;
+                        }
+
+                        for path in recent {
+                            let exists = path.is_file();
+                            let label = path
+                                .file_name()
+                                .map(|n| n.to_string_lossy().into_owned())
+                                .unwrap_or_else(|| path.display().to_string());
+
+                            if ui
+                                .add_enabled(exists, egui::Button::new(label))
+                                .on_hover_text(path.display().to_string())
+                                .clicked()
+                            {
+                                let _ = self.open_file(path);
+                                ui.close();
+                            }
+                        }
+
+                        ui.separator();
+                        if ui.button("Clear recent").clicked() {
+                            self.persisted.recent_files.clear();
+                            ui.close();
+                        }
+                    });
                     let reload_enabled = self
                         .active_document()
                         .and_then(|d| d.file_path.as_ref())
@@ -491,9 +995,14 @@ impl eframe::App for MarkdownViewerApp {
                     {
                         self.reload_active();
                     }
+                    if ui.button("Find…").on_hover_text("Ctrl+F").clicked() {
+                        self.find.open = true;
+                        self.find.focus_query = true;
+                    }
 
                     ui.separator();
 
+                    let mut auto_reload_changed = false;
                     ui.menu_button("Options", |ui| {
                         let mut changed = false;
                         changed |= ui
@@ -505,6 +1014,12 @@ impl eframe::App for MarkdownViewerApp {
                         changed |= ui
                             .checkbox(&mut self.settings.render_mermaid, "Render Mermaid diagrams")
                             .changed();
+                        ui.separator();
+                        ui.checkbox(&mut self.settings.show_outline, "Show outline panel");
+                        auto_reload_changed |= ui
+                            .checkbox(&mut self.settings.auto_reload, "Auto-reload changed files")
+                            .changed();
+                        ui.separator();
                         changed |= ui
                             .checkbox(
                                 &mut self.settings.auto_detect_code_lang,
@@ -536,6 +1051,9 @@ impl eframe::App for MarkdownViewerApp {
                             self.rebuild_all_markdown();
                         }
                     });
+                    if auto_reload_changed {
+                        self.update_watched_paths();
+                    }
 
                     ui.separator();
 
@@ -585,6 +1103,60 @@ impl eframe::App for MarkdownViewerApp {
             });
         });
 
+        if self.settings.show_outline {
+            let outline = self
+                .active_document()
+                .map(|doc| doc.outline.clone())
+                .unwrap_or_default();
+            let mut jump_to_line = None::<usize>;
+
+            egui::SidePanel::left("outline_panel")
+                .resizable(true)
+                .default_width(220.0)
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.heading("Outline");
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.button("×").on_hover_text("Hide outline").clicked() {
+                                self.settings.show_outline = false;
+                            }
+                        });
+                    });
+                    ui.separator();
+
+                    if ui.button("Top").clicked() {
+                        jump_to_line = Some(0);
+                    }
+                    ui.add_space(4.0);
+
+                    if outline.is_empty() {
+                        ui.weak("No headings");
+                        return;
+                    }
+
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        for item in &outline {
+                            ui.horizontal(|ui| {
+                                ui.add_space(((item.level.saturating_sub(1)) as f32) * 12.0);
+                                if ui
+                                    .selectable_label(false, &item.title)
+                                    .on_hover_text(format!("Line {}", item.line + 1))
+                                    .clicked()
+                                {
+                                    jump_to_line = Some(item.line);
+                                }
+                            });
+                        }
+                    });
+                });
+
+            if let Some(line) = jump_to_line {
+                if let Some(doc) = self.active_document_mut() {
+                    doc.scroll_to_line = Some(line);
+                }
+            }
+        }
+
         egui::CentralPanel::default().show(ctx, |ui| {
             if let Some(err) = &self.error {
                 ui.colored_label(ui.visuals().error_fg_color, err);
@@ -603,7 +1175,13 @@ impl eframe::App for MarkdownViewerApp {
                 return;
             };
 
-            egui::ScrollArea::vertical().show(ui, |ui| {
+            let line_height = ui.text_style_height(&TextStyle::Body) + ui.spacing().item_spacing.y;
+            let mut scroll_area = egui::ScrollArea::vertical().id_salt(doc.id);
+            if let Some(line) = doc.scroll_to_line.take() {
+                scroll_area = scroll_area.vertical_scroll_offset((line as f32) * line_height);
+            }
+
+            scroll_area.show(ui, |ui| {
                 let render_math_fn = move |ui: &mut egui::Ui, tex: &str, inline: bool| {
                     render_math(ui, tex, inline, &math_cache, &math_tx);
                 };
@@ -628,7 +1206,26 @@ impl eframe::App for MarkdownViewerApp {
                 viewer.show(ui, &mut doc.commonmark_cache, &doc.markdown);
             });
         });
+
+        self.show_find_window(ctx);
     }
+
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        self.persisted.settings = self.settings.clone();
+        self.persisted.open_files = self
+            .documents
+            .iter()
+            .filter_map(|doc| doc.file_path.clone())
+            .collect();
+        self.persisted.active_file = self
+            .active_document()
+            .and_then(|doc| doc.file_path.clone());
+        eframe::set_value(storage, STATE_KEY, &self.persisted);
+    }
+}
+
+fn normalize_path(path: PathBuf) -> PathBuf {
+    std::fs::canonicalize(&path).unwrap_or(path)
 }
 
 fn read_markdown(path: &Path) -> Result<String> {
@@ -724,7 +1321,8 @@ fn parse_github_remote(remote: &str) -> Option<String> {
     None
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 struct ViewerSettings {
     theme_preference: egui::ThemePreference,
     render_math: bool,
@@ -734,6 +1332,8 @@ struct ViewerSettings {
     github_links: bool,
     replace_emoji: bool,
     smart_typography: bool,
+    show_outline: bool,
+    auto_reload: bool,
 }
 
 impl Default for ViewerSettings {
@@ -747,6 +1347,38 @@ impl Default for ViewerSettings {
             github_links: true,
             replace_emoji: true,
             smart_typography: false,
+            show_outline: true,
+            auto_reload: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+struct PersistedState {
+    settings: ViewerSettings,
+    recent_files: Vec<PathBuf>,
+    open_files: Vec<PathBuf>,
+    active_file: Option<PathBuf>,
+}
+
+impl Default for PersistedState {
+    fn default() -> Self {
+        Self {
+            settings: ViewerSettings::default(),
+            recent_files: Vec::new(),
+            open_files: Vec::new(),
+            active_file: None,
+        }
+    }
+}
+
+impl PersistedState {
+    fn remember_file(&mut self, path: PathBuf) {
+        self.recent_files.retain(|p| p != &path);
+        self.recent_files.insert(0, path);
+        if self.recent_files.len() > MAX_RECENT_FILES {
+            self.recent_files.truncate(MAX_RECENT_FILES);
         }
     }
 }
