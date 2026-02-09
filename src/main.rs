@@ -1449,13 +1449,33 @@ enum TerminalHue {
     Amber,
 }
 
+fn restore_default_visuals(ctx: &egui::Context) {
+    ctx.set_visuals_of(egui::Theme::Dark, egui::Visuals::dark());
+    ctx.set_visuals_of(egui::Theme::Light, egui::Visuals::light());
+}
+
 fn apply_app_theme(ctx: &egui::Context, theme: AppTheme) {
     match theme {
-        AppTheme::System => ctx.set_theme(egui::ThemePreference::System),
-        AppTheme::Dark => ctx.set_theme(egui::ThemePreference::Dark),
-        AppTheme::Light => ctx.set_theme(egui::ThemePreference::Light),
-        AppTheme::TerminalGreen => ctx.set_visuals(terminal_visuals(TerminalHue::Green)),
-        AppTheme::TerminalAmber => ctx.set_visuals(terminal_visuals(TerminalHue::Amber)),
+        AppTheme::System => {
+            restore_default_visuals(ctx);
+            ctx.set_theme(egui::ThemePreference::System);
+        }
+        AppTheme::Dark => {
+            restore_default_visuals(ctx);
+            ctx.set_theme(egui::ThemePreference::Dark);
+        }
+        AppTheme::Light => {
+            restore_default_visuals(ctx);
+            ctx.set_theme(egui::ThemePreference::Light);
+        }
+        AppTheme::TerminalGreen => {
+            ctx.set_theme(egui::ThemePreference::Dark);
+            ctx.set_visuals_of(egui::Theme::Dark, terminal_visuals(TerminalHue::Green));
+        }
+        AppTheme::TerminalAmber => {
+            ctx.set_theme(egui::ThemePreference::Dark);
+            ctx.set_visuals_of(egui::Theme::Dark, terminal_visuals(TerminalHue::Amber));
+        }
     }
 }
 
