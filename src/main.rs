@@ -2778,6 +2778,74 @@ impl eframe::App for MarkdownViewerApp {
                         self.update_watched_paths();
                     }
 
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing = egui::vec2(2.0, 0.0);
+                        if ui.button("📂").on_hover_text("Open file (Ctrl+O)").clicked() {
+                            self.open_dialog();
+                        }
+
+                        let reload_enabled = self
+                            .active_document()
+                            .and_then(|d| d.file_path.as_ref())
+                            .is_some();
+                        if ui
+                            .add_enabled(reload_enabled, egui::Button::new("🔄"))
+                            .on_hover_text("Reload file")
+                            .clicked()
+                        {
+                            self.reload_active();
+                        }
+
+                        if ui.button("🔍").on_hover_text("Find (Ctrl+F)").clicked() {
+                            self.find.open = true;
+                            self.find.focus_query = true;
+                        }
+
+                        ui.separator();
+
+                        ui.selectable_value(
+                            &mut self.settings.view_mode,
+                            ViewMode::EditorOnly,
+                            "Editor",
+                        );
+                        ui.selectable_value(&mut self.settings.view_mode, ViewMode::Split, "Split");
+                        ui.selectable_value(
+                            &mut self.settings.view_mode,
+                            ViewMode::PreviewOnly,
+                            "Preview",
+                        );
+
+                        ui.separator();
+
+                        let theme_before = self.settings.theme;
+                        ui.selectable_value(&mut self.settings.theme, AppTheme::System, "💻")
+                            .on_hover_text("System theme");
+                        ui.selectable_value(&mut self.settings.theme, AppTheme::Dark, "🌙")
+                            .on_hover_text("Dark theme");
+                        ui.selectable_value(&mut self.settings.theme, AppTheme::Light, "☀")
+                            .on_hover_text("Light theme");
+                        ui.selectable_value(
+                            &mut self.settings.theme,
+                            AppTheme::TerminalGreen,
+                            egui::RichText::new("G>")
+                                .monospace()
+                                .color(egui::Color32::from_rgb(0x00, 0xff, 0x7a)),
+                        )
+                        .on_hover_text("Green terminal theme");
+                        ui.selectable_value(
+                            &mut self.settings.theme,
+                            AppTheme::TerminalAmber,
+                            egui::RichText::new("A>")
+                                .monospace()
+                                .color(egui::Color32::from_rgb(0xff, 0xb0, 0x36)),
+                        )
+                        .on_hover_text("Amber terminal theme");
+                        if theme_before != self.settings.theme {
+                            apply_app_theme(ctx, self.settings.theme);
+                            self.clear_render_caches();
+                        }
+                    });
+
                     ui.add_space(4.0);
                     self.show_tab_bar(ui);
                 });
