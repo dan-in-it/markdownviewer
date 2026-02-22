@@ -7,7 +7,7 @@ build = "build.rs"
 [dependencies]
 anyhow = "1.0.100"
 eframe = { version = "0.33.3", features = ["persistence"] }
-egui_commonmark = { version = "0.22.0", features = ["better_syntax_highlighting", "svg"] }
+egui_commonmark = { version = "0.22.0", default-features = false, features = ["pulldown_cmark", "load-images", "better_syntax_highlighting", "svg"] }
 emojis = "0.8.0"
 linkify = "0.10.0"
 mathjax_svg = "3.2.0"

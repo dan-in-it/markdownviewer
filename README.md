@@ -4,7 +4,7 @@ A Windows GUI Markdown file viewer written in Rust (built with `eframe`/`egui`).
 
 ## Features
 
-- CommonMark + GitHub Flavored Markdown (tables, task lists, strikethrough)
+- Standards-compliant CommonMark rendering via `pulldown-cmark`, with GitHub Flavored Markdown extensions (tables, task lists, strikethrough)
 - Footnotes, definition lists, and GitHub-style callouts/admonitions
 - Math rendering (`$...$` / `$$...$$`) via MathJax → SVG
 - Mermaid diagrams via Kroki (` ```mermaid ` fences → SVG; requires internet)
