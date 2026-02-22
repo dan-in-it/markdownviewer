@@ -21,6 +21,7 @@ use eframe::egui::TextStyle;
 use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
 use rand::Rng as _;
 use regex::{Captures, Regex};
+use scraper::{Html, node::Node};
 use serde::{Deserialize, Serialize};
 
 const STATE_KEY: &str = "markdownviewer_state_v1";
@@ -641,6 +642,24 @@ struct MarkdownViewerApp {
     drop_zone_visible: bool,
     image_config: ImageConfig,
     notifications: Vec<Notification>,
+    smart_paste_config: SmartPasteConfig,
+}
+
+#[derive(Debug, Clone)]
+struct SmartPasteConfig {
+    enabled: bool,
+    strip_tracking_params: bool,
+    max_nesting_depth: usize,
+}
+
+impl Default for SmartPasteConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            strip_tracking_params: true,
+            max_nesting_depth: 6,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -738,6 +757,7 @@ impl MarkdownViewerApp {
             drop_zone_visible: false,
             image_config: ImageConfig::default(),
             notifications: Vec::new(),
+            smart_paste_config: SmartPasteConfig::default(),
         };
 
         apply_app_theme(&cc.egui_ctx, app.settings.theme);
@@ -1263,6 +1283,403 @@ impl MarkdownViewerApp {
                 });
             });
     }
+
+    fn handle_smart_paste_shortcuts(&mut self, ctx: &egui::Context) {
+        if !self.smart_paste_config.enabled || !self.editor_has_focus {
+            return;
+        }
+
+        let plain_shortcut = ctx.input(|i| {
+            i.modifiers.command
+                && i.modifiers.shift
+                && !i.modifiers.alt
+                && i.key_pressed(egui::Key::V)
+        });
+        let raw_shortcut = ctx.input(|i| {
+            i.modifiers.command
+                && i.modifiers.alt
+                && !i.modifiers.shift
+                && i.key_pressed(egui::Key::V)
+        });
+        let smart_shortcut = ctx.input(|i| {
+            i.modifiers.command
+                && !i.modifiers.shift
+                && !i.modifiers.alt
+                && i.key_pressed(egui::Key::V)
+        });
+
+        if !(smart_shortcut || plain_shortcut || raw_shortcut) {
+            return;
+        }
+
+        let Ok(mut clipboard) = arboard::Clipboard::new() else {
+            return;
+        };
+
+        if smart_shortcut {
+            if let Ok(image) = clipboard.get_image() {
+                let _ = ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::V));
+                self.process_images_for_active_doc(vec![PendingImage {
+                    name: "pasted-image.png".to_string(),
+                    mime: "image/png".to_string(),
+                    bytes: image.bytes.into_owned(),
+                }]);
+                return;
+            }
+        }
+
+        let html = clipboard.get().html().ok().unwrap_or_default();
+        if html.trim().is_empty() {
+            return;
+        }
+
+        if raw_shortcut {
+            let _ = clipboard.set_text(html);
+            self.push_error("Pasted as raw HTML");
+            return;
+        }
+
+        if plain_shortcut {
+            self.push_error("Pasted as plain text");
+            return;
+        }
+
+        let source = detect_paste_source(&html);
+        let preprocessed = preprocess_pasted_html(&html, source);
+        let markdown = convert_html_to_markdown(&preprocessed, &self.smart_paste_config);
+        if markdown.is_empty() {
+            return;
+        }
+
+        let _ = clipboard.set_text(markdown);
+        self.push_error("Pasted as Markdown");
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PasteSource {
+    GoogleDocs,
+    Word,
+    Notion,
+    Confluence,
+    Generic,
+}
+
+fn detect_paste_source(html: &str) -> PasteSource {
+    if html.contains("docs-internal-guid") {
+        return PasteSource::GoogleDocs;
+    }
+    if html.contains("class=\"Mso") || html.contains("mso-") {
+        return PasteSource::Word;
+    }
+    if html.contains("data-block-id") {
+        return PasteSource::Notion;
+    }
+    if html.contains("confluenceTd") || html.contains("confluenceTh") {
+        return PasteSource::Confluence;
+    }
+    PasteSource::Generic
+}
+
+fn preprocess_pasted_html(html: &str, source: PasteSource) -> String {
+    let mut out = html.to_string();
+    static WORD_COMMENTS_RE: OnceLock<Regex> = OnceLock::new();
+    static O_P_TAG_RE: OnceLock<Regex> = OnceLock::new();
+
+    if source == PasteSource::Word {
+        out = WORD_COMMENTS_RE
+            .get_or_init(|| Regex::new(r"(?is)<!--\[if.*?<!\[endif\]-->").expect("valid"))
+            .replace_all(&out, "")
+            .to_string();
+        out = O_P_TAG_RE
+            .get_or_init(|| Regex::new(r"(?is)</?o:p[^>]*>").expect("valid"))
+            .replace_all(&out, "")
+            .to_string();
+    }
+    out
+}
+
+fn convert_html_to_markdown(html: &str, config: &SmartPasteConfig) -> String {
+    if html.trim().is_empty() {
+        return String::new();
+    }
+    let fragment = Html::parse_fragment(html);
+    let mut out = String::new();
+    for child in fragment.tree.root().children() {
+        out.push_str(&convert_node(&child, config, 0));
+    }
+    post_process_markdown(&out)
+}
+
+fn convert_node(
+    node: &ego_tree::NodeRef<'_, Node>,
+    config: &SmartPasteConfig,
+    depth: usize,
+) -> String {
+    match node.value() {
+        Node::Text(text) => text.text.to_string(),
+        Node::Comment(_) => String::new(),
+        Node::Element(el) => {
+            let tag = el.name.local.to_string();
+            let children = || {
+                let mut s = String::new();
+                for child in node.children() {
+                    s.push_str(&convert_node(&child, config, depth));
+                }
+                s
+            };
+
+            match tag.as_str() {
+                "script" | "style" | "noscript" | "iframe" | "object" | "embed" | "form"
+                | "button" | "select" | "textarea" | "nav" | "footer" | "header" => String::new(),
+                "strong" | "b" => format!("**{}**", children().trim()),
+                "em" | "i" => format!("*{}*", children().trim()),
+                "s" | "strike" | "del" => format!("~~{}~~", children().trim()),
+                "u" => format!("<u>{}</u>", children().trim()),
+                "code" if tag != "pre" => {
+                    let content = children();
+                    if content.contains('`') {
+                        format!("``{content}``")
+                    } else {
+                        format!("`{content}`")
+                    }
+                }
+                "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
+                    let level = tag[1..].parse::<usize>().unwrap_or(1).clamp(1, 6);
+                    format!("\n{} {}\n\n", "#".repeat(level), children().trim())
+                }
+                "p" | "div" | "section" | "article" | "main" | "aside" => {
+                    let text = children().trim().to_string();
+                    if text.is_empty() {
+                        String::new()
+                    } else {
+                        format!("{text}\n\n")
+                    }
+                }
+                "br" => "  \n".to_string(),
+                "hr" => "\n---\n\n".to_string(),
+                "a" => {
+                    let text = children().trim().to_string();
+                    if let Some(href) = el.attr("href") {
+                        let href = clean_url(href, config);
+                        if text == href {
+                            format!("<{href}>")
+                        } else {
+                            format!("[{text}]({href})")
+                        }
+                    } else {
+                        text
+                    }
+                }
+                "img" => {
+                    if let Some(src) = el.attr("src") {
+                        let alt = el.attr("alt").unwrap_or_default();
+                        format!("![{alt}]({src})")
+                    } else {
+                        String::new()
+                    }
+                }
+                "ul" => convert_list(node, config, false, depth),
+                "ol" => convert_list(node, config, true, depth),
+                "blockquote" => {
+                    let inner = children();
+                    inner
+                        .lines()
+                        .map(|line| format!("> {line}"))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                        + "\n\n"
+                }
+                "pre" => {
+                    let mut code = String::new();
+                    for child in node.children() {
+                        if let Node::Element(code_el) = child.value()
+                            && code_el.name.local.to_string() == "code"
+                        {
+                            for grandchild in child.children() {
+                                code.push_str(&convert_node(&grandchild, config, depth + 1));
+                            }
+                            break;
+                        }
+                        code.push_str(&convert_node(&child, config, depth + 1));
+                    }
+                    format!("\n```\n{}\n```\n\n", code.trim_end())
+                }
+                "table" => convert_table(node, config),
+                _ => children(),
+            }
+        }
+        _ => String::new(),
+    }
+}
+
+fn convert_list(
+    node: &ego_tree::NodeRef<'_, Node>,
+    config: &SmartPasteConfig,
+    ordered: bool,
+    depth: usize,
+) -> String {
+    let mut lines = Vec::new();
+    let mut index = 1usize;
+    let indent = "  ".repeat(depth.min(config.max_nesting_depth));
+    for child in node.children() {
+        if let Node::Element(el) = child.value()
+            && el.name.local.to_string() == "li"
+        {
+            let mut has_checkbox = None;
+            for li_child in child.children() {
+                if let Node::Element(input) = li_child.value()
+                    && input.name.local.to_string() == "input"
+                    && input.attr("type") == Some("checkbox")
+                {
+                    has_checkbox = Some(input.attr("checked").is_some());
+                }
+            }
+
+            let mut text = String::new();
+            for li_child in child.children() {
+                if let Node::Element(input) = li_child.value()
+                    && input.name.local.to_string() == "input"
+                {
+                    continue;
+                }
+                text.push_str(&convert_node(&li_child, config, depth + 1));
+            }
+            let text = text.trim().to_string();
+
+            let marker = if ordered {
+                let m = format!("{index}.");
+                index += 1;
+                m
+            } else {
+                "-".to_string()
+            };
+            let item = if let Some(checked) = has_checkbox {
+                format!(
+                    "{indent}{marker} [{}] {text}",
+                    if checked { "x" } else { " " }
+                )
+            } else {
+                format!("{indent}{marker} {text}")
+            };
+            lines.push(item);
+        }
+    }
+    format!("{}\n\n", lines.join("\n"))
+}
+
+fn convert_table(node: &ego_tree::NodeRef<'_, Node>, config: &SmartPasteConfig) -> String {
+    let mut rows: Vec<Vec<String>> = Vec::new();
+    for child in node.children() {
+        collect_table_rows(&child, config, &mut rows);
+    }
+    if rows.is_empty() {
+        return String::new();
+    }
+    let width = rows.iter().map(|r| r.len()).max().unwrap_or(0);
+    if width == 0 {
+        return String::new();
+    }
+    for row in &mut rows {
+        while row.len() < width {
+            row.push(String::new());
+        }
+    }
+    let mut out = String::new();
+    let header = &rows[0];
+    out.push_str(&format!("| {} |\n", header.join(" | ")));
+    out.push_str(&format!("|{}|\n", vec!["---"; width].join("|")));
+    for row in rows.iter().skip(1) {
+        out.push_str(&format!("| {} |\n", row.join(" | ")));
+    }
+    format!("\n{out}\n")
+}
+
+fn collect_table_rows(
+    node: &ego_tree::NodeRef<'_, Node>,
+    config: &SmartPasteConfig,
+    rows: &mut Vec<Vec<String>>,
+) {
+    if let Node::Element(el) = node.value() {
+        let tag = el.name.local.to_string();
+        if tag == "tr" {
+            let mut row = Vec::new();
+            for cell in node.children() {
+                if let Node::Element(cell_el) = cell.value() {
+                    let ctag = cell_el.name.local.to_string();
+                    if ctag == "th" || ctag == "td" {
+                        let mut text = String::new();
+                        for gc in cell.children() {
+                            text.push_str(&convert_node(&gc, config, 0));
+                        }
+                        row.push(text.trim().replace('|', "\\|"));
+                    }
+                }
+            }
+            rows.push(row);
+            return;
+        }
+    }
+    for child in node.children() {
+        collect_table_rows(&child, config, rows);
+    }
+}
+
+fn clean_url(url: &str, config: &SmartPasteConfig) -> String {
+    let escaped = url.replace('(', r"\(").replace(')', r"\)");
+    if !config.strip_tracking_params {
+        return escaped;
+    }
+
+    let Some((base, query)) = url.split_once('?') else {
+        return escaped;
+    };
+
+    let stripped = query
+        .split('&')
+        .filter(|entry| {
+            let key = entry.split('=').next().unwrap_or_default();
+            !matches!(
+                key,
+                "utm_source" | "utm_medium" | "utm_campaign" | "utm_content" | "utm_term"
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("&");
+
+    let rebuilt = if stripped.is_empty() {
+        base.to_string()
+    } else {
+        format!("{base}?{stripped}")
+    };
+    rebuilt.replace('(', r"\(").replace(')', r"\)")
+}
+
+fn post_process_markdown(markdown: &str) -> String {
+    static MANY_BREAKS_RE: OnceLock<Regex> = OnceLock::new();
+    static ZW_RE: OnceLock<Regex> = OnceLock::new();
+    let mut out = markdown.to_string();
+    out = ZW_RE
+        .get_or_init(|| Regex::new(r"[\u{200B}\u{FEFF}]").expect("valid"))
+        .replace_all(&out, "")
+        .replace('\u{00A0}', " ")
+        .to_string();
+    out = out
+        .lines()
+        .map(|line| {
+            if line.ends_with("  ") {
+                line.to_string()
+            } else {
+                line.trim_end().to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    out = MANY_BREAKS_RE
+        .get_or_init(|| Regex::new(r"\n{3,}").expect("valid"))
+        .replace_all(&out, "\n\n")
+        .to_string();
+    out.trim().to_string()
 }
 
 fn store_image_for_doc(doc: &Document, cfg: &ImageConfig, file: &PendingImage) -> Result<String> {
@@ -1681,6 +2098,8 @@ impl eframe::App for MarkdownViewerApp {
             }
         }
 
+        self.handle_smart_paste_shortcuts(ctx);
+
         egui::CentralPanel::default().show(ctx, |ui| {
             if let Some(err) = &self.error {
                 ui.colored_label(ui.visuals().error_fg_color, err);
@@ -1714,21 +2133,6 @@ impl eframe::App for MarkdownViewerApp {
                 }
             }
             self.editor_has_focus = editor_has_focus;
-
-            if self.editor_has_focus
-                && ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::V))
-            {
-                if let Ok(mut clipboard) = arboard::Clipboard::new() {
-                    if let Ok(image) = clipboard.get_image() {
-                        let bytes = image.bytes.into_owned();
-                        self.process_images_for_active_doc(vec![PendingImage {
-                            name: "pasted-image.png".to_string(),
-                            mime: "image/png".to_string(),
-                            bytes,
-                        }]);
-                    }
-                }
-            }
 
             ui.separator();
             ui.label("Preview");
@@ -2984,4 +3388,25 @@ fn dedent_block(text: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn converts_basic_formatting() {
+        let md = convert_html_to_markdown("<p><strong>Hello</strong> <em>world</em></p>", &SmartPasteConfig::default());
+        assert_eq!(md, "**Hello** *world*");
+    }
+
+    #[test]
+    fn converts_lists_and_links() {
+        let md = convert_html_to_markdown(
+            r#"<ul><li>One</li><li><a href='https://example.com?a=1&utm_source=x'>Two</a></li></ul>"#,
+            &SmartPasteConfig::default(),
+        );
+        assert!(md.contains("- One"));
+        assert!(md.contains("[Two](https://example.com?a=1)"));
+    }
 }
