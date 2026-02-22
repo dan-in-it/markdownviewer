@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     io::Write,
     thread,
     time::{Duration, Instant},
@@ -575,6 +575,288 @@ struct FindState {
     last_case_sensitive: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+enum SlashCategory {
+    Headings,
+    Lists,
+    Blocks,
+    Inline,
+    Tables,
+    Media,
+    Transforms,
+    Custom,
+}
+
+#[derive(Debug, Clone)]
+struct SlashCommand {
+    id: &'static str,
+    name: &'static str,
+    description: &'static str,
+    category: SlashCategory,
+    aliases: &'static [&'static str],
+    keywords: &'static [&'static str],
+    insert_text: &'static str,
+    when_has_selection: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+struct SlashCommandConfig {
+    enabled: bool,
+    trigger_char: char,
+    show_descriptions: bool,
+    show_recently_used: bool,
+    recently_used_count: usize,
+}
+
+impl Default for SlashCommandConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            trigger_char: '/',
+            show_descriptions: true,
+            show_recently_used: true,
+            recently_used_count: 3,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+struct SlashCommandTracker {
+    counts: HashMap<String, usize>,
+    recent: VecDeque<String>,
+    total_uses: usize,
+}
+
+impl SlashCommandTracker {
+    fn record_use(&mut self, id: &str) {
+        *self.counts.entry(id.to_string()).or_insert(0) += 1;
+        self.total_uses = self.total_uses.saturating_add(1);
+        self.recent.retain(|entry| entry != id);
+        self.recent.push_front(id.to_string());
+        if self.recent.len() > 20 {
+            self.recent.pop_back();
+        }
+    }
+
+    fn top_recent(&self, max: usize) -> Vec<String> {
+        if self.total_uses >= 50 {
+            let mut sorted: Vec<_> = self.counts.iter().collect();
+            sorted.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
+            sorted
+                .into_iter()
+                .take(max)
+                .map(|(id, _)| id.clone())
+                .collect()
+        } else {
+            self.recent.iter().take(max).cloned().collect()
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone)]
+struct SlashMenuState {
+    open: bool,
+    trigger_char_index: usize,
+    trigger_line: usize,
+    query: String,
+    selected_idx: usize,
+    anchor: egui::Pos2,
+}
+
+#[derive(Debug, Clone)]
+struct SlashMatch {
+    cmd_idx: usize,
+    score: f32,
+}
+
+fn slash_registry() -> Vec<SlashCommand> {
+    vec![
+        SlashCommand {
+            id: "heading-1",
+            name: "Heading 1",
+            description: "Large section heading",
+            category: SlashCategory::Headings,
+            aliases: &["h1", "title"],
+            keywords: &["header", "section"],
+            insert_text: "# ",
+            when_has_selection: None,
+        },
+        SlashCommand {
+            id: "heading-2",
+            name: "Heading 2",
+            description: "Medium section heading",
+            category: SlashCategory::Headings,
+            aliases: &["h2", "subtitle"],
+            keywords: &["header"],
+            insert_text: "## ",
+            when_has_selection: None,
+        },
+        SlashCommand {
+            id: "heading-3",
+            name: "Heading 3",
+            description: "Small section heading",
+            category: SlashCategory::Headings,
+            aliases: &["h3"],
+            keywords: &["header"],
+            insert_text: "### ",
+            when_has_selection: None,
+        },
+        SlashCommand {
+            id: "bullet-list",
+            name: "Bullet List",
+            description: "Unordered list item",
+            category: SlashCategory::Lists,
+            aliases: &["ul", "unordered", "dash"],
+            keywords: &["list"],
+            insert_text: "- ",
+            when_has_selection: None,
+        },
+        SlashCommand {
+            id: "numbered-list",
+            name: "Numbered List",
+            description: "Ordered list item",
+            category: SlashCategory::Lists,
+            aliases: &["ol", "ordered", "number"],
+            keywords: &["list"],
+            insert_text: "1. ",
+            when_has_selection: None,
+        },
+        SlashCommand {
+            id: "task-list",
+            name: "Task List",
+            description: "Checkbox list item",
+            category: SlashCategory::Lists,
+            aliases: &["todo", "checkbox"],
+            keywords: &["check"],
+            insert_text: "- [ ] ",
+            when_has_selection: None,
+        },
+        SlashCommand {
+            id: "blockquote",
+            name: "Blockquote",
+            description: "Quoted text",
+            category: SlashCategory::Blocks,
+            aliases: &["quote", "citation"],
+            keywords: &["blockquote"],
+            insert_text: "> ",
+            when_has_selection: None,
+        },
+        SlashCommand {
+            id: "code-block",
+            name: "Code Block",
+            description: "Fenced code block",
+            category: SlashCategory::Blocks,
+            aliases: &["code", "fence", "pre"],
+            keywords: &["snippet"],
+            insert_text: "```\n\n```",
+            when_has_selection: None,
+        },
+        SlashCommand {
+            id: "horizontal-rule",
+            name: "Horizontal Rule",
+            description: "Divider line",
+            category: SlashCategory::Blocks,
+            aliases: &["hr", "divider", "separator"],
+            keywords: &["line"],
+            insert_text: "\n---\n",
+            when_has_selection: None,
+        },
+        SlashCommand {
+            id: "bold",
+            name: "Bold",
+            description: "Bold text",
+            category: SlashCategory::Inline,
+            aliases: &["strong", "b"],
+            keywords: &["format"],
+            insert_text: "****",
+            when_has_selection: None,
+        },
+        SlashCommand {
+            id: "italic",
+            name: "Italic",
+            description: "Italic text",
+            category: SlashCategory::Inline,
+            aliases: &["em", "i"],
+            keywords: &["format"],
+            insert_text: "**",
+            when_has_selection: None,
+        },
+        SlashCommand {
+            id: "inline-code",
+            name: "Inline Code",
+            description: "Code span",
+            category: SlashCategory::Inline,
+            aliases: &["mono", "backtick"],
+            keywords: &["code"],
+            insert_text: "``",
+            when_has_selection: None,
+        },
+        SlashCommand {
+            id: "link",
+            name: "Link",
+            description: "Insert a hyperlink",
+            category: SlashCategory::Inline,
+            aliases: &["url", "href"],
+            keywords: &["anchor"],
+            insert_text: "[text](url)",
+            when_has_selection: None,
+        },
+        SlashCommand {
+            id: "table",
+            name: "Table",
+            description: "Insert 3x3 table",
+            category: SlashCategory::Tables,
+            aliases: &["grid"],
+            keywords: &["columns", "rows"],
+            insert_text: "| Column 1 | Column 2 | Column 3 |\n| --- | --- | --- |\n|  |  |  |\n|  |  |  |",
+            when_has_selection: None,
+        },
+        SlashCommand {
+            id: "toc",
+            name: "Table of Contents",
+            description: "Insert TOC marker",
+            category: SlashCategory::Tables,
+            aliases: &["contents", "toc"],
+            keywords: &["headings"],
+            insert_text: "[[toc]]",
+            when_has_selection: None,
+        },
+        SlashCommand {
+            id: "convert-blockquote",
+            name: "Convert to Blockquote",
+            description: "Wrap lines in blockquote",
+            category: SlashCategory::Transforms,
+            aliases: &["make quote"],
+            keywords: &["transform"],
+            insert_text: "> ",
+            when_has_selection: Some(true),
+        },
+    ]
+}
+
+fn fuzzy_score(query: &str, haystack: &str) -> Option<f32> {
+    if query.is_empty() {
+        return Some(1.0);
+    }
+    let mut q = query.chars().map(|c| c.to_ascii_lowercase());
+    let mut current = q.next()?;
+    let mut matched = 0usize;
+    for ch in haystack.chars().map(|c| c.to_ascii_lowercase()) {
+        if ch == current {
+            matched += 1;
+            if let Some(next) = q.next() {
+                current = next;
+            } else {
+                let density = matched as f32 / haystack.len().max(1) as f32;
+                return Some((matched as f32 / query.len().max(1) as f32) + density);
+            }
+        }
+    }
+    None
+}
+
 fn find_matches(text: &str, query: &str, case_sensitive: bool) -> Vec<FindMatch> {
     const MAX_MATCHES: usize = 500;
     if query.is_empty() {
@@ -643,6 +925,10 @@ struct MarkdownViewerApp {
     image_config: ImageConfig,
     notifications: Vec<Notification>,
     smart_paste_config: SmartPasteConfig,
+    slash_commands: Vec<SlashCommand>,
+    slash_menu: SlashMenuState,
+    slash_config: SlashCommandConfig,
+    slash_tracker: SlashCommandTracker,
 }
 
 #[derive(Debug, Clone)]
@@ -722,6 +1008,7 @@ impl MarkdownViewerApp {
             .and_then(|storage| eframe::get_value(storage, STATE_KEY))
             .unwrap_or_default();
         let settings = persisted.settings.clone();
+        let slash_tracker = persisted.slash_tracker.clone();
 
         let math_cache: Arc<Mutex<HashMap<MathKey, SvgState>>> =
             Arc::new(Mutex::new(HashMap::new()));
@@ -758,6 +1045,10 @@ impl MarkdownViewerApp {
             image_config: ImageConfig::default(),
             notifications: Vec::new(),
             smart_paste_config: SmartPasteConfig::default(),
+            slash_commands: slash_registry(),
+            slash_menu: SlashMenuState::default(),
+            slash_config: SlashCommandConfig::default(),
+            slash_tracker,
         };
 
         apply_app_theme(&cc.egui_ctx, app.settings.theme);
@@ -1740,6 +2031,131 @@ fn chrono_like_timestamp() -> u64 {
         .unwrap_or(0)
 }
 
+impl MarkdownViewerApp {
+    fn byte_index_from_char_index(text: &str, char_index: usize) -> usize {
+        text.char_indices()
+            .nth(char_index)
+            .map(|(idx, _)| idx)
+            .unwrap_or(text.len())
+    }
+
+    fn detect_inline_code(line_prefix: &str) -> bool {
+        line_prefix.chars().filter(|c| *c == '`').count() % 2 == 1
+    }
+
+    fn maybe_open_slash_menu(
+        &mut self,
+        cursor_char_index: usize,
+        cursor_line: usize,
+        text: &str,
+        anchor: egui::Pos2,
+    ) {
+        if !self.slash_config.enabled || !self.editor_has_focus {
+            return;
+        }
+        let before = &text[..Self::byte_index_from_char_index(text, cursor_char_index)];
+        let mut line_start = 0usize;
+        if let Some(last_nl) = before.rfind('\n') {
+            line_start = last_nl + 1;
+        }
+        let line_prefix = &before[line_start..];
+        if Self::detect_inline_code(line_prefix) {
+            return;
+        }
+        if line_prefix.ends_with("```") || before.matches("\n```").count() % 2 == 1 {
+            return;
+        }
+        let Some(ch) = before.chars().last() else {
+            return;
+        };
+        if ch != self.slash_config.trigger_char {
+            return;
+        }
+        let prev = line_prefix.chars().rev().nth(1);
+        let allowed = prev.is_none() || prev == Some(' ') || line_prefix.ends_with("> /");
+        if !allowed {
+            return;
+        }
+
+        self.slash_menu.open = true;
+        self.slash_menu.trigger_char_index = cursor_char_index.saturating_sub(1);
+        self.slash_menu.trigger_line = cursor_line;
+        self.slash_menu.query.clear();
+        self.slash_menu.selected_idx = 0;
+        self.slash_menu.anchor = anchor;
+    }
+
+    fn slash_matches(&self, has_selection: bool) -> Vec<SlashMatch> {
+        let query = self.slash_menu.query.trim();
+        let mut out = Vec::new();
+        for (idx, cmd) in self.slash_commands.iter().enumerate() {
+            if let Some(needs_sel) = cmd.when_has_selection
+                && needs_sel != has_selection
+            {
+                continue;
+            }
+            let score = fuzzy_score(query, cmd.name)
+                .or_else(|| cmd.aliases.iter().find_map(|a| fuzzy_score(query, a)))
+                .or_else(|| cmd.keywords.iter().find_map(|k| fuzzy_score(query, k)));
+            if let Some(score) = score {
+                out.push(SlashMatch {
+                    cmd_idx: idx,
+                    score,
+                });
+            }
+        }
+        out.sort_by(|a, b| b.score.total_cmp(&a.score));
+        if query.is_empty() && self.slash_config.show_recently_used {
+            let recent = self
+                .slash_tracker
+                .top_recent(self.slash_config.recently_used_count);
+            out.sort_by_key(|m| {
+                recent
+                    .iter()
+                    .position(|id| id == self.slash_commands[m.cmd_idx].id)
+                    .unwrap_or(usize::MAX)
+            });
+        }
+        out
+    }
+
+    fn execute_slash_command(&mut self, cmd: &SlashCommand, cursor_char_index: usize) {
+        let settings = self.settings.clone();
+        let mut applied = false;
+        let trigger_char_index = self.slash_menu.trigger_char_index;
+        if let Some(doc) = self.active_document_mut() {
+            let start = Self::byte_index_from_char_index(&doc.raw_markdown, trigger_char_index);
+            let end = Self::byte_index_from_char_index(&doc.raw_markdown, cursor_char_index);
+            if start <= end && end <= doc.raw_markdown.len() {
+                doc.raw_markdown.replace_range(start..end, cmd.insert_text);
+                doc.rebuild_markdown(&settings);
+                applied = true;
+            }
+        }
+        if applied {
+            self.slash_tracker.record_use(cmd.id);
+        }
+        self.slash_menu.open = false;
+    }
+
+    fn dismiss_slash_menu(&mut self, remove_typed: bool, cursor_char_index: usize) {
+        let settings = self.settings.clone();
+        if remove_typed {
+            let trigger_char_index = self.slash_menu.trigger_char_index;
+            if let Some(doc) = self.active_document_mut() {
+                let start = Self::byte_index_from_char_index(&doc.raw_markdown, trigger_char_index);
+                let end = Self::byte_index_from_char_index(&doc.raw_markdown, cursor_char_index);
+                if start <= end && end <= doc.raw_markdown.len() {
+                    doc.raw_markdown.replace_range(start..end, "");
+                    doc.rebuild_markdown(&settings);
+                }
+            }
+        }
+        self.slash_menu.open = false;
+        self.slash_menu.query.clear();
+    }
+}
+
 impl eframe::App for MarkdownViewerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let dropped_paths: Vec<PathBuf> = ctx.input(|i| {
@@ -2119,20 +2535,160 @@ impl eframe::App for MarkdownViewerApp {
             }
 
             let editor_has_focus;
+            let mut cursor_char_index = None::<usize>;
+            let mut cursor_line = 0usize;
+            let mut has_selection = false;
+            let mut open_slash_args = None::<(usize, usize, String, egui::Pos2)>;
             {
                 let doc = &mut self.documents[self.active_doc];
-                let edit_resp = ui.add(
-                    egui::TextEdit::multiline(&mut doc.raw_markdown)
-                        .code_editor()
-                        .desired_width(f32::INFINITY)
-                        .desired_rows(12),
-                );
-                editor_has_focus = edit_resp.has_focus();
-                if edit_resp.changed() {
+                let output = egui::TextEdit::multiline(&mut doc.raw_markdown)
+                    .code_editor()
+                    .desired_width(f32::INFINITY)
+                    .desired_rows(12)
+                    .show(ui);
+                editor_has_focus = output.response.has_focus();
+                if let Some(range) = output.cursor_range {
+                    cursor_char_index = Some(range.primary.index);
+                    has_selection = range.primary.index != range.secondary.index;
+                    let before = &doc.raw_markdown[..Self::byte_index_from_char_index(
+                        &doc.raw_markdown,
+                        range.primary.index,
+                    )];
+                    cursor_line = before.bytes().filter(|b| *b == b'\n').count();
+                }
+                if output.response.changed() {
                     doc.rebuild_markdown(&self.settings);
+                    if let Some(index) = cursor_char_index {
+                        open_slash_args = Some((
+                            index,
+                            cursor_line,
+                            doc.raw_markdown.clone(),
+                            output.response.rect.left_bottom(),
+                        ));
+                    }
                 }
             }
             self.editor_has_focus = editor_has_focus;
+            if let Some((index, line, text, anchor)) = open_slash_args {
+                self.maybe_open_slash_menu(index, line, &text, anchor);
+            }
+
+            if self.slash_menu.open {
+                if let Some(index) = cursor_char_index {
+                    if cursor_line != self.slash_menu.trigger_line {
+                        self.dismiss_slash_menu(false, index);
+                    } else if let Some(doc) = self.active_document() {
+                        let start = Self::byte_index_from_char_index(
+                            &doc.raw_markdown,
+                            self.slash_menu.trigger_char_index + 1,
+                        );
+                        let end = Self::byte_index_from_char_index(&doc.raw_markdown, index);
+                        if start <= end && end <= doc.raw_markdown.len() {
+                            self.slash_menu.query = doc.raw_markdown[start..end].to_string();
+                        }
+                    }
+                }
+            }
+
+            if self.slash_menu.open {
+                let matches = self.slash_matches(has_selection);
+                if matches.len() == 1 {
+                    self.slash_menu.selected_idx = 0;
+                } else if self.slash_menu.selected_idx >= matches.len() {
+                    self.slash_menu.selected_idx = 0;
+                }
+
+                let mut dismiss_escape = false;
+                let mut execute = false;
+                let mut move_next = false;
+                let mut move_prev = false;
+                let mut dismiss_on_space = false;
+                ctx.input(|i| {
+                    dismiss_escape = i.key_pressed(egui::Key::Escape);
+                    execute = i.key_pressed(egui::Key::Enter);
+                    move_next = i.key_pressed(egui::Key::ArrowDown)
+                        || i.key_pressed(egui::Key::Tab) && !i.modifiers.shift;
+                    move_prev = i.key_pressed(egui::Key::ArrowUp)
+                        || (i.key_pressed(egui::Key::Tab) && i.modifiers.shift);
+                    dismiss_on_space = i.key_pressed(egui::Key::Space) && matches.is_empty();
+                });
+                if move_next && !matches.is_empty() {
+                    self.slash_menu.selected_idx =
+                        (self.slash_menu.selected_idx + 1) % matches.len();
+                }
+                if move_prev && !matches.is_empty() {
+                    self.slash_menu.selected_idx = if self.slash_menu.selected_idx == 0 {
+                        matches.len() - 1
+                    } else {
+                        self.slash_menu.selected_idx - 1
+                    };
+                }
+                if dismiss_escape {
+                    if let Some(index) = cursor_char_index {
+                        self.dismiss_slash_menu(true, index);
+                    }
+                } else if dismiss_on_space {
+                    self.slash_menu.open = false;
+                } else if execute {
+                    if let (Some(index), Some(entry)) =
+                        (cursor_char_index, matches.get(self.slash_menu.selected_idx))
+                    {
+                        let cmd = self.slash_commands[entry.cmd_idx].clone();
+                        self.execute_slash_command(&cmd, index);
+                    }
+                }
+
+                if self.slash_menu.open {
+                    let mut clicked_cmd: Option<SlashCommand> = None;
+                    let frame = egui::Frame::popup(ui.style())
+                        .corner_radius(egui::CornerRadius::same(4))
+                        .shadow(egui::epaint::Shadow {
+                            offset: [0, 4],
+                            blur: 12,
+                            spread: 0,
+                            color: egui::Color32::from_black_alpha(26),
+                        });
+                    egui::Area::new("slash_menu".into())
+                        .order(egui::Order::Foreground)
+                        .fixed_pos(self.slash_menu.anchor + egui::vec2(0.0, 4.0))
+                        .show(ctx, |ui| {
+                            frame.show(ui, |ui| {
+                                ui.set_min_width(280.0);
+                                ui.set_max_width(360.0);
+                                ui.set_max_height(340.0);
+                                if matches.is_empty() {
+                                    ui.weak("No commands found");
+                                } else {
+                                    egui::ScrollArea::vertical()
+                                        .max_height(340.0)
+                                        .show(ui, |ui| {
+                                            for (i, m) in matches.iter().enumerate() {
+                                                let cmd = self.slash_commands[m.cmd_idx].clone();
+                                                let selected = i == self.slash_menu.selected_idx;
+                                                let mut label = egui::RichText::new(cmd.name);
+                                                if selected {
+                                                    label = label.strong();
+                                                }
+                                                let row = ui.selectable_label(selected, label);
+                                                if row.clicked() {
+                                                    clicked_cmd = Some(cmd.clone());
+                                                }
+                                                if self.slash_config.show_descriptions {
+                                                    ui.small(
+                                                        egui::RichText::new(cmd.description).weak(),
+                                                    );
+                                                }
+                                                ui.add_space(2.0);
+                                            }
+                                        });
+                                }
+                            });
+                        });
+                    if let (Some(index), Some(cmd)) = (cursor_char_index, clicked_cmd) {
+                        self.execute_slash_command(&cmd, index);
+                    }
+                }
+            }
 
             ui.separator();
             ui.label("Preview");
@@ -2210,6 +2766,7 @@ impl eframe::App for MarkdownViewerApp {
             .filter_map(|doc| doc.file_path.clone())
             .collect();
         self.persisted.active_file = self.active_document().and_then(|doc| doc.file_path.clone());
+        self.persisted.slash_tracker = self.slash_tracker.clone();
         eframe::set_value(storage, STATE_KEY, &self.persisted);
     }
 }
@@ -2483,6 +3040,7 @@ struct PersistedState {
     recent_files: Vec<PathBuf>,
     open_files: Vec<PathBuf>,
     active_file: Option<PathBuf>,
+    slash_tracker: SlashCommandTracker,
 }
 
 impl Default for PersistedState {
@@ -2492,6 +3050,7 @@ impl Default for PersistedState {
             recent_files: Vec::new(),
             open_files: Vec::new(),
             active_file: None,
+            slash_tracker: SlashCommandTracker::default(),
         }
     }
 }
@@ -3396,7 +3955,10 @@ mod tests {
 
     #[test]
     fn converts_basic_formatting() {
-        let md = convert_html_to_markdown("<p><strong>Hello</strong> <em>world</em></p>", &SmartPasteConfig::default());
+        let md = convert_html_to_markdown(
+            "<p><strong>Hello</strong> <em>world</em></p>",
+            &SmartPasteConfig::default(),
+        );
         assert_eq!(md, "**Hello** *world*");
     }
 
