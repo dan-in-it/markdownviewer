@@ -162,6 +162,50 @@ fn with_alpha(color: egui::Color32, alpha: u8) -> egui::Color32 {
     egui::Color32::from_rgba_unmultiplied(r, g, b, alpha)
 }
 
+fn render_line_preview(line: &str) -> egui::RichText {
+    let trimmed = line.trim_start();
+    if let Some((level, title)) = parse_heading_line(trimmed) {
+        let size = [2.0, 1.6, 1.35, 1.15, 1.0, 0.9][level.saturating_sub(1)] as f32 * 16.0;
+        return egui::RichText::new(title.to_string())
+            .size(size)
+            .strong()
+            .color(egui::Color32::from_rgb(235, 235, 245));
+    }
+
+    let mut out = line.to_string();
+    out = bold_regex().replace_all(&out, "$1").to_string();
+    out = italic_regex().replace_all(&out, "$1").to_string();
+    out = code_regex().replace_all(&out, "$1").to_string();
+    egui::RichText::new(out)
+}
+
+fn parse_heading_line(line: &str) -> Option<(usize, &str)> {
+    let hashes = line.chars().take_while(|c| *c == '#').count();
+    if !(1..=6).contains(&hashes) {
+        return None;
+    }
+    let rest = line.get(hashes..)?.trim_start();
+    if rest.is_empty() {
+        return None;
+    }
+    Some((hashes, rest))
+}
+
+fn bold_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"\*\*(.*?)\*\*").expect("valid bold regex"))
+}
+
+fn italic_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"\*(.*?)\*").expect("valid italic regex"))
+}
+
+fn code_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"`(.*?)`").expect("valid code regex"))
+}
+
 fn set_pixel(rgba: &mut [u8], size: u32, x: i32, y: i32, r: u8, g: u8, b: u8, a: u8) {
     if x < 0 || y < 0 {
         return;
@@ -929,6 +973,12 @@ struct MarkdownViewerApp {
     slash_menu: SlashMenuState,
     slash_config: SlashCommandConfig,
     slash_tracker: SlashCommandTracker,
+    inline_state: InlineSurfaceState,
+}
+
+#[derive(Debug, Default, Clone)]
+struct InlineSurfaceState {
+    editing_line: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -1049,6 +1099,7 @@ impl MarkdownViewerApp {
             slash_menu: SlashMenuState::default(),
             slash_config: SlashCommandConfig::default(),
             slash_tracker,
+            inline_state: InlineSurfaceState::default(),
         };
 
         apply_app_theme(&cc.egui_ctx, app.settings.theme);
@@ -2138,6 +2189,70 @@ impl MarkdownViewerApp {
         self.slash_menu.open = false;
     }
 
+    fn show_inline_surface(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let line_height = ui.text_style_height(&TextStyle::Body) + ui.spacing().item_spacing.y;
+        let (doc_id, scroll_to_line) = {
+            let doc = &mut self.documents[self.active_doc];
+            (doc.id, doc.scroll_to_line.take())
+        };
+
+        let mut scroll_area = egui::ScrollArea::vertical().id_salt(("inline", doc_id));
+        if let Some(line) = scroll_to_line {
+            scroll_area = scroll_area.vertical_scroll_offset((line as f32) * line_height);
+        }
+
+        scroll_area.show(ui, |ui| {
+            let mut changed = false;
+            let mut new_editing = self.inline_state.editing_line;
+            let doc = &mut self.documents[self.active_doc];
+            let mut lines: Vec<String> = doc.raw_markdown.lines().map(ToOwned::to_owned).collect();
+            if lines.is_empty() {
+                lines.push(String::new());
+            }
+
+            for (idx, line) in lines.iter_mut().enumerate() {
+                let is_editing = new_editing == Some(idx);
+                let row_id = ui.make_persistent_id((doc.id, idx));
+                let rendered_t = if self.settings.inline_render.animate_transitions {
+                    ctx.animate_bool(row_id, !is_editing)
+                } else if is_editing {
+                    0.0
+                } else {
+                    1.0
+                };
+
+                if is_editing {
+                    let resp =
+                        ui.add(egui::TextEdit::singleline(line).desired_width(f32::INFINITY));
+                    changed |= resp.changed();
+                    if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        new_editing = None;
+                    }
+                } else {
+                    let rich = render_line_preview(line);
+                    let text = if rendered_t > 0.99 {
+                        rich
+                    } else {
+                        egui::RichText::new(line.as_str()).monospace()
+                    };
+                    let resp = ui.add(egui::Label::new(text).sense(egui::Sense::click()));
+                    if resp.clicked() {
+                        new_editing = Some(idx);
+                    }
+                }
+            }
+
+            if changed || new_editing != self.inline_state.editing_line {
+                self.inline_state.editing_line = new_editing;
+                doc.raw_markdown = lines.join(
+                    "
+",
+                );
+                doc.rebuild_markdown(&self.settings);
+            }
+        });
+    }
+
     fn dismiss_slash_menu(&mut self, remove_typed: bool, cursor_char_index: usize) {
         let settings = self.settings.clone();
         if remove_typed {
@@ -2346,6 +2461,10 @@ impl eframe::App for MarkdownViewerApp {
                             .changed();
                         ui.separator();
                         ui.checkbox(&mut self.settings.show_outline, "Show outline panel");
+                        ui.checkbox(
+                            &mut self.settings.inline_render.enabled,
+                            "Inline live rendering (experimental)",
+                        );
                         auto_reload_changed |= ui
                             .checkbox(&mut self.settings.auto_reload, "Auto-reload changed files")
                             .changed();
@@ -2531,6 +2650,11 @@ impl eframe::App for MarkdownViewerApp {
 
             if self.documents.get(self.active_doc).is_none() {
                 ui.weak("No documents open");
+                return;
+            }
+
+            if self.settings.inline_render.enabled {
+                self.show_inline_surface(ui, ctx);
                 return;
             }
 
@@ -3014,6 +3138,7 @@ struct ViewerSettings {
     smart_typography: bool,
     show_outline: bool,
     auto_reload: bool,
+    inline_render: InlineRenderConfig,
 }
 
 impl Default for ViewerSettings {
@@ -3029,7 +3154,117 @@ impl Default for ViewerSettings {
             smart_typography: false,
             show_outline: true,
             auto_reload: false,
+            inline_render: InlineRenderConfig::default(),
         }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+struct InlineRenderConfig {
+    enabled: bool,
+    animate_transitions: bool,
+    spring_preset: SpringPreset,
+    max_concurrent_animations: usize,
+    proximity_reveal: bool,
+}
+
+impl Default for InlineRenderConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            animate_transitions: true,
+            spring_preset: SpringPreset::Smooth,
+            max_concurrent_animations: 200,
+            proximity_reveal: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+enum SpringPreset {
+    Snappy,
+    Smooth,
+    Gentle,
+    Bouncy,
+    Stiff,
+    None,
+}
+
+#[derive(Debug, Clone)]
+struct Spring {
+    stiffness: f64,
+    damping: f64,
+    mass: f64,
+    velocity: f64,
+    current: f64,
+    target: f64,
+    rest_threshold: f64,
+}
+
+impl Spring {
+    fn new(stiffness: f64, damping: f64, mass: f64) -> Self {
+        Self {
+            stiffness,
+            damping,
+            mass,
+            velocity: 0.0,
+            current: 0.0,
+            target: 0.0,
+            rest_threshold: 0.0001,
+        }
+    }
+
+    fn tick(&mut self, dt: f64) -> f64 {
+        let force = -self.stiffness * (self.current - self.target);
+        let damping_force = -self.damping * self.velocity;
+        let acceleration = (force + damping_force) / self.mass;
+        self.velocity += acceleration * dt;
+        self.current += self.velocity * dt;
+
+        if (self.current - self.target).abs() < self.rest_threshold
+            && self.velocity.abs() < self.rest_threshold
+        {
+            self.current = self.target;
+            self.velocity = 0.0;
+        }
+
+        self.current
+    }
+}
+
+struct AnimationPresets;
+
+impl AnimationPresets {
+    fn spring(preset: SpringPreset) -> Spring {
+        match preset {
+            SpringPreset::Snappy => Spring::new(400.0, 30.0, 1.0),
+            SpringPreset::Smooth => Spring::new(300.0, 25.0, 1.0),
+            SpringPreset::Gentle => Spring::new(200.0, 22.0, 1.0),
+            SpringPreset::Bouncy => Spring::new(400.0, 15.0, 1.0),
+            SpringPreset::Stiff => Spring::new(500.0, 35.0, 1.0),
+            SpringPreset::None => Spring::new(1_000_000.0, 10_000.0, 1.0),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct PositionMap {
+    rendered_to_source: Vec<(usize, usize)>,
+    source_to_rendered: Vec<(usize, usize)>,
+}
+
+impl PositionMap {
+    fn for_wrapped_delimiters(source: &str, left_delim: usize, right_delim: usize) -> Self {
+        let mut map = PositionMap::default();
+        let visible_start = left_delim.min(source.chars().count());
+        let visible_end = source.chars().count().saturating_sub(right_delim);
+        for rendered in 0..visible_end.saturating_sub(visible_start) {
+            let source_col = rendered + visible_start;
+            map.rendered_to_source.push((rendered, source_col));
+            map.source_to_rendered.push((source_col, rendered));
+        }
+        map
     }
 }
 
@@ -3970,5 +4205,27 @@ mod tests {
         );
         assert!(md.contains("- One"));
         assert!(md.contains("[Two](https://example.com?a=1)"));
+    }
+}
+
+#[cfg(test)]
+mod inline_tests {
+    use super::*;
+
+    #[test]
+    fn spring_converges_to_target() {
+        let mut spring = AnimationPresets::spring(SpringPreset::Smooth);
+        spring.target = 1.0;
+        for _ in 0..240 {
+            spring.tick(1.0 / 120.0);
+        }
+        assert!((spring.current - 1.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn position_map_handles_bold_wrapper() {
+        let map = PositionMap::for_wrapped_delimiters("**bold**", 2, 2);
+        assert_eq!(map.rendered_to_source.first().copied(), Some((0, 2)));
+        assert_eq!(map.rendered_to_source.last().copied(), Some((3, 5)));
     }
 }
