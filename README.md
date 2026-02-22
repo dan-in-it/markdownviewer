@@ -63,3 +63,7 @@ Open a file:
 - Or pass a path on startup: `markdownviewer path/to/file.md`
 
 Reload the current file with **Reload**.
+## Reference
+
+- [Markdown editor keyboard shortcuts](docs/keyboard-shortcuts.md)
+
