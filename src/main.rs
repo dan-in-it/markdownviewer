@@ -3,19 +3,23 @@
     windows_subsystem = "windows"
 )]
 
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::{
     collections::{HashMap, HashSet},
+    io::Write,
     thread,
     time::{Duration, Instant},
 };
 
 use anyhow::{Context as _, Result};
+use base64::Engine as _;
 use eframe::egui;
 use eframe::egui::TextStyle;
 use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
+use rand::Rng as _;
 use regex::{Captures, Regex};
 use serde::{Deserialize, Serialize};
 
@@ -633,6 +637,59 @@ struct MarkdownViewerApp {
     mermaid_cache: Arc<Mutex<HashMap<MermaidKey, SvgState>>>,
     mermaid_tx: mpsc::Sender<MermaidKey>,
     error: Option<String>,
+    editor_has_focus: bool,
+    drop_zone_visible: bool,
+    image_config: ImageConfig,
+    notifications: Vec<Notification>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ImageStorageMode {
+    Local,
+    Base64,
+    Remote,
+}
+
+#[derive(Debug, Clone)]
+struct ImageConfig {
+    storage_mode: ImageStorageMode,
+    local_path: String,
+    remote_endpoint: Option<String>,
+    max_file_size_mb: usize,
+    allowed_types: Vec<&'static str>,
+    base64_max_size_kb: usize,
+}
+
+impl Default for ImageConfig {
+    fn default() -> Self {
+        Self {
+            storage_mode: ImageStorageMode::Local,
+            local_path: "./assets/images/".to_string(),
+            remote_endpoint: None,
+            max_file_size_mb: 10,
+            allowed_types: vec![
+                "image/png",
+                "image/jpeg",
+                "image/gif",
+                "image/webp",
+                "image/svg+xml",
+            ],
+            base64_max_size_kb: 500,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PendingImage {
+    name: String,
+    mime: String,
+    bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+struct Notification {
+    message: String,
+    created_at: Instant,
 }
 
 impl MarkdownViewerApp {
@@ -677,6 +734,10 @@ impl MarkdownViewerApp {
             mermaid_cache,
             mermaid_tx,
             error: None,
+            editor_has_focus: false,
+            drop_zone_visible: false,
+            image_config: ImageConfig::default(),
+            notifications: Vec::new(),
         };
 
         apply_app_theme(&cc.egui_ctx, app.settings.theme);
@@ -1116,6 +1177,150 @@ impl MarkdownViewerApp {
         doc.scroll_to_line = Some(line);
         ctx.request_repaint();
     }
+
+    fn push_error(&mut self, message: impl Into<String>) {
+        self.notifications.push(Notification {
+            message: message.into(),
+            created_at: Instant::now(),
+        });
+    }
+
+    fn process_images_for_active_doc(&mut self, files: Vec<PendingImage>) {
+        if files.is_empty() {
+            return;
+        }
+        let settings = self.settings.clone();
+        let image_config = self.image_config.clone();
+        for file in files {
+            if !image_config.allowed_types.iter().any(|t| *t == file.mime) {
+                self.push_error("Only image files are supported.");
+                continue;
+            }
+            let max_bytes = image_config.max_file_size_mb * 1024 * 1024;
+            if file.bytes.len() > max_bytes {
+                self.push_error(format!(
+                    "Image exceeds maximum size of {}MB.",
+                    image_config.max_file_size_mb
+                ));
+                continue;
+            }
+
+            if self.documents.get(self.active_doc).is_none() {
+                continue;
+            }
+            let placeholder_id = rand::rng().random::<u32>();
+            let placeholder = format!("![Uploading image...](placeholder-{placeholder_id})");
+            {
+                let doc = &mut self.documents[self.active_doc];
+                if !doc.raw_markdown.ends_with('\n') {
+                    doc.raw_markdown.push('\n');
+                }
+                doc.raw_markdown.push_str(&placeholder);
+                doc.raw_markdown.push('\n');
+            }
+
+            let store_result = {
+                let doc = &self.documents[self.active_doc];
+                store_image_for_doc(doc, &image_config, &file)
+            };
+
+            let final_markdown = match store_result {
+                Ok(markdown) => markdown,
+                Err(err) => {
+                    self.push_error(err.to_string());
+                    format!("<!-- image upload failed: {} -->", file.name)
+                }
+            };
+
+            let doc = &mut self.documents[self.active_doc];
+            doc.raw_markdown = doc.raw_markdown.replacen(&placeholder, &final_markdown, 1);
+            doc.rebuild_markdown(&settings);
+        }
+    }
+
+    fn show_notifications(&mut self, ctx: &egui::Context) {
+        self.notifications
+            .retain(|n| n.created_at.elapsed() < Duration::from_secs(5));
+        if self.notifications.is_empty() {
+            return;
+        }
+        egui::Area::new("error_toasts".into())
+            .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-16.0, -16.0))
+            .show(ctx, |ui| {
+                ui.vertical(|ui| {
+                    for note in &self.notifications {
+                        egui::Frame::new()
+                            .fill(egui::Color32::from_rgb(90, 20, 20))
+                            .corner_radius(egui::CornerRadius::same(6))
+                            .inner_margin(egui::Margin::same(8))
+                            .show(ui, |ui| {
+                                ui.colored_label(
+                                    egui::Color32::from_rgb(255, 220, 220),
+                                    &note.message,
+                                );
+                            });
+                    }
+                });
+            });
+    }
+}
+
+fn store_image_for_doc(doc: &Document, cfg: &ImageConfig, file: &PendingImage) -> Result<String> {
+    let ext = Path::new(&file.name)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("png");
+    let random = format!("{:04x}", rand::rng().random::<u16>());
+    let mut filename = format!("image-{}-{random}.{ext}", chrono_like_timestamp());
+    match cfg.storage_mode {
+        ImageStorageMode::Local => {
+            let doc_dir = doc
+                .file_path
+                .as_ref()
+                .and_then(|p| p.parent())
+                .unwrap_or_else(|| Path::new("."));
+            let base_dir = doc_dir.join(cfg.local_path.trim_start_matches("./"));
+            fs::create_dir_all(&base_dir)?;
+            let mut output = base_dir.join(&filename);
+            while output.exists() {
+                filename = format!(
+                    "image-{}-{:06x}.{ext}",
+                    chrono_like_timestamp(),
+                    rand::rng().random::<u32>() & 0x00ff_ffff
+                );
+                output = base_dir.join(&filename);
+            }
+            let mut f = fs::File::create(output)?;
+            f.write_all(&file.bytes)?;
+            Ok(format!("![](./assets/images/{filename})"))
+        }
+        ImageStorageMode::Base64 => {
+            if file.bytes.len() > cfg.base64_max_size_kb * 1024 {
+                anyhow::bail!("Image too large for base64 mode.")
+            }
+            let encoded = base64::engine::general_purpose::STANDARD.encode(&file.bytes);
+            Ok(format!("![](data:{};base64,{encoded})", file.mime))
+        }
+        ImageStorageMode::Remote => {
+            let endpoint = cfg
+                .remote_endpoint
+                .as_ref()
+                .context("remote endpoint is not configured")?;
+            let resp = reqwest::blocking::Client::new()
+                .post(endpoint)
+                .body(file.bytes.clone())
+                .send()?;
+            let url = resp.text()?;
+            Ok(format!("![]({})", url.trim()))
+        }
+    }
+}
+
+fn chrono_like_timestamp() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 impl eframe::App for MarkdownViewerApp {
@@ -1127,8 +1332,81 @@ impl eframe::App for MarkdownViewerApp {
                 .filter_map(|f| f.path.clone())
                 .collect()
         });
-        for path in dropped_paths {
-            let _ = self.open_file(path);
+        let dropped_images: Vec<PendingImage> = ctx.input(|i| {
+            i.raw
+                .dropped_files
+                .iter()
+                .filter_map(|f| {
+                    let mime = f.mime.clone();
+                    let bytes = f.bytes.as_ref()?.to_vec();
+                    Some(PendingImage {
+                        name: if f.name.is_empty() {
+                            f.path
+                                .as_ref()
+                                .and_then(|p| {
+                                    p.file_name().map(|n| n.to_string_lossy().into_owned())
+                                })
+                                .unwrap_or_else(|| "image.png".to_string())
+                        } else {
+                            f.name.clone()
+                        },
+                        mime,
+                        bytes,
+                    })
+                })
+                .collect()
+        });
+
+        self.drop_zone_visible = ctx.input(|i| !i.raw.hovered_files.is_empty());
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.drop_zone_visible = false;
+        }
+        if self.editor_has_focus {
+            self.process_images_for_active_doc(dropped_images);
+            for path in dropped_paths {
+                if path.is_file() {
+                    match fs::read(&path) {
+                        Ok(bytes) => {
+                            let mime = infer_mime_from_path(&path);
+                            self.process_images_for_active_doc(vec![PendingImage {
+                                name: path
+                                    .file_name()
+                                    .map(|n| n.to_string_lossy().into_owned())
+                                    .unwrap_or_else(|| "image.png".to_string()),
+                                mime,
+                                bytes,
+                            }]);
+                        }
+                        Err(err) => self.push_error(format!("Failed to read dropped file: {err}")),
+                    }
+                }
+            }
+        } else {
+            for path in dropped_paths {
+                let _ = self.open_file(path);
+            }
+        }
+
+        if ctx.input(|i| i.modifiers.command && i.modifiers.shift && i.key_pressed(egui::Key::I)) {
+            if let Some(files) = rfd::FileDialog::new()
+                .add_filter("Images", &["png", "jpg", "jpeg", "gif", "webp", "svg"])
+                .pick_files()
+            {
+                let mut pending = Vec::new();
+                for path in files {
+                    if let Ok(bytes) = fs::read(&path) {
+                        pending.push(PendingImage {
+                            name: path
+                                .file_name()
+                                .map(|n| n.to_string_lossy().into_owned())
+                                .unwrap_or_default(),
+                            mime: infer_mime_from_path(&path),
+                            bytes,
+                        });
+                    }
+                }
+                self.process_images_for_active_doc(pending);
+            }
         }
 
         if ctx.input(|i| i.key_pressed(egui::Key::F) && i.modifiers.command) {
@@ -1152,6 +1430,27 @@ impl eframe::App for MarkdownViewerApp {
                 ui.horizontal(|ui| {
                     if ui.button("Open…").clicked() {
                         self.open_dialog();
+                    }
+                    if ui.button("🖼 Upload image").clicked() {
+                        if let Some(files) = rfd::FileDialog::new()
+                            .add_filter("Images", &["png", "jpg", "jpeg", "gif", "webp", "svg"])
+                            .pick_files()
+                        {
+                            let mut pending = Vec::new();
+                            for path in files {
+                                if let Ok(bytes) = fs::read(&path) {
+                                    pending.push(PendingImage {
+                                        name: path
+                                            .file_name()
+                                            .map(|n| n.to_string_lossy().into_owned())
+                                            .unwrap_or_default(),
+                                        mime: infer_mime_from_path(&path),
+                                        bytes,
+                                    });
+                                }
+                            }
+                            self.process_images_for_active_doc(pending);
+                        }
                     }
                     ui.menu_button("Recent", |ui| {
                         let recent = self.persisted.recent_files.clone();
@@ -1245,6 +1544,25 @@ impl eframe::App for MarkdownViewerApp {
                                 "Smart typography (off by default)",
                             )
                             .changed();
+                        ui.separator();
+                        ui.label("Image storage mode");
+                        ui.horizontal(|ui| {
+                            ui.selectable_value(
+                                &mut self.image_config.storage_mode,
+                                ImageStorageMode::Local,
+                                "Local",
+                            );
+                            ui.selectable_value(
+                                &mut self.image_config.storage_mode,
+                                ImageStorageMode::Base64,
+                                "Base64",
+                            );
+                            ui.selectable_value(
+                                &mut self.image_config.storage_mode,
+                                ImageStorageMode::Remote,
+                                "Remote",
+                            );
+                        });
                         if changed {
                             self.rebuild_all_markdown();
                         }
@@ -1376,14 +1694,52 @@ impl eframe::App for MarkdownViewerApp {
             let render_math_enabled = self.settings.render_math;
             let render_mermaid_enabled = self.settings.render_mermaid;
 
-            let Some(doc) = self.active_document_mut() else {
+            if self.documents.get(self.active_doc).is_none() {
                 ui.weak("No documents open");
                 return;
-            };
+            }
+
+            let editor_has_focus;
+            {
+                let doc = &mut self.documents[self.active_doc];
+                let edit_resp = ui.add(
+                    egui::TextEdit::multiline(&mut doc.raw_markdown)
+                        .code_editor()
+                        .desired_width(f32::INFINITY)
+                        .desired_rows(12),
+                );
+                editor_has_focus = edit_resp.has_focus();
+                if edit_resp.changed() {
+                    doc.rebuild_markdown(&self.settings);
+                }
+            }
+            self.editor_has_focus = editor_has_focus;
+
+            if self.editor_has_focus
+                && ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::V))
+            {
+                if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                    if let Ok(image) = clipboard.get_image() {
+                        let bytes = image.bytes.into_owned();
+                        self.process_images_for_active_doc(vec![PendingImage {
+                            name: "pasted-image.png".to_string(),
+                            mime: "image/png".to_string(),
+                            bytes,
+                        }]);
+                    }
+                }
+            }
+
+            ui.separator();
+            ui.label("Preview");
 
             let line_height = ui.text_style_height(&TextStyle::Body) + ui.spacing().item_spacing.y;
-            let mut scroll_area = egui::ScrollArea::vertical().id_salt(doc.id);
-            if let Some(line) = doc.scroll_to_line.take() {
+            let (doc_id, scroll_to_line) = {
+                let doc = &mut self.documents[self.active_doc];
+                (doc.id, doc.scroll_to_line.take())
+            };
+            let mut scroll_area = egui::ScrollArea::vertical().id_salt(doc_id);
+            if let Some(line) = scroll_to_line {
                 scroll_area = scroll_area.vertical_scroll_offset((line as f32) * line_height);
             }
 
@@ -1409,12 +1765,37 @@ impl eframe::App for MarkdownViewerApp {
                     viewer = viewer.render_html_fn(Some(&render_html_fn));
                 }
 
+                let doc = &mut self.documents[self.active_doc];
                 viewer.show(ui, &mut doc.commonmark_cache, &doc.markdown);
             });
+
+            if self.drop_zone_visible && self.editor_has_focus {
+                let rect = ui.max_rect();
+                let painter = ui.painter();
+                painter.rect_filled(
+                    rect,
+                    egui::CornerRadius::same(8),
+                    egui::Color32::from_rgba_unmultiplied(59, 130, 246, 20),
+                );
+                painter.rect_stroke(
+                    rect.shrink(4.0),
+                    egui::CornerRadius::same(8),
+                    egui::Stroke::new(2.0, egui::Color32::from_rgb(59, 130, 246)),
+                    egui::StrokeKind::Middle,
+                );
+                painter.text(
+                    rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    "🖼 Drop image here",
+                    egui::TextStyle::Heading.resolve(ui.style()),
+                    egui::Color32::from_rgb(59, 130, 246),
+                );
+            }
         });
 
         self.show_find_window(ctx);
         self.handle_internal_anchor_links(ctx);
+        self.show_notifications(ctx);
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
@@ -1431,6 +1812,24 @@ impl eframe::App for MarkdownViewerApp {
 
 fn normalize_path(path: PathBuf) -> PathBuf {
     std::fs::canonicalize(&path).unwrap_or(path)
+}
+
+fn infer_mime_from_path(path: &Path) -> String {
+    match path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "svg" => "image/svg+xml",
+        _ => "application/octet-stream",
+    }
+    .to_string()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

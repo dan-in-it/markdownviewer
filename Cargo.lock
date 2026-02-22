@@ -2207,6 +2207,8 @@ name = "markdownviewer"
 version = "0.2.0"
 dependencies = [
  "anyhow",
+ "arboard",
+ "base64",
  "eframe",
  "egui_commonmark",
  "embed-resource",
@@ -2214,6 +2216,7 @@ dependencies = [
  "linkify",
  "mathjax_svg",
  "notify",
+ "rand 0.9.2",
  "regex",
  "reqwest",
  "rfd",
