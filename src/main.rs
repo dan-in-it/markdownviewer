@@ -206,6 +206,27 @@ fn code_regex() -> &'static Regex {
     RE.get_or_init(|| Regex::new(r"`(.*?)`").expect("valid code regex"))
 }
 
+fn left_truncate(text: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
+    let char_count = text.chars().count();
+    if char_count <= max_chars {
+        return text.to_string();
+    }
+    let keep = max_chars.saturating_sub(1);
+    let tail: String = text.chars().skip(char_count.saturating_sub(keep)).collect();
+    format!("…{tail}")
+}
+
+fn outline_item_label(level: usize, title: &str) -> egui::RichText {
+    match level {
+        1 => egui::RichText::new(title).strong().size(17.0),
+        2 => egui::RichText::new(title).strong().size(15.0),
+        _ => egui::RichText::new(title).size(13.0),
+    }
+}
+
 fn set_pixel(rgba: &mut [u8], size: u32, x: i32, y: i32, r: u8, g: u8, b: u8, a: u8) {
     if x < 0 || y < 0 {
         return;
@@ -981,6 +1002,15 @@ struct InlineSurfaceState {
     editing_line: Option<usize>,
 }
 
+#[derive(Debug, Default)]
+struct EditorUiState {
+    has_focus: bool,
+    cursor_char_index: Option<usize>,
+    cursor_line: usize,
+    has_selection: bool,
+    open_slash_args: Option<(usize, usize, String, egui::Pos2)>,
+}
+
 #[derive(Debug, Clone)]
 struct SmartPasteConfig {
     enabled: bool,
@@ -1473,9 +1503,8 @@ impl MarkdownViewerApp {
                             .fill(fill)
                             .stroke(egui::Stroke::new(1.0, stroke_color))
                             .corner_radius(egui::CornerRadius::same(6))
-                            .inner_margin(egui::Margin::symmetric(8, 6))
+                            .inner_margin(egui::Margin::symmetric(10, 4))
                             .show(ui, |ui| {
-                                ui.set_min_width(120.0);
                                 ui.horizontal(|ui| {
                                     let label = doc.display_name();
                                     let mut label_resp =
@@ -1486,16 +1515,18 @@ impl MarkdownViewerApp {
                                     if label_resp.clicked() {
                                         self.active_doc = idx;
                                     }
-                                    if ui
-                                        .add(
-                                            egui::Button::new("×")
-                                                .small()
-                                                .fill(egui::Color32::TRANSPARENT),
-                                        )
-                                        .on_hover_text("Close tab")
-                                        .clicked()
-                                    {
-                                        close_tab = Some(idx);
+                                    if is_active || label_resp.hovered() {
+                                        if ui
+                                            .add(
+                                                egui::Button::new("×")
+                                                    .small()
+                                                    .fill(egui::Color32::TRANSPARENT),
+                                            )
+                                            .on_hover_text("Close tab")
+                                            .clicked()
+                                        {
+                                            close_tab = Some(idx);
+                                        }
                                     }
                                 });
                             })
@@ -2253,6 +2284,90 @@ impl MarkdownViewerApp {
         });
     }
 
+    fn show_editor_pane(&mut self, ui: &mut egui::Ui) -> EditorUiState {
+        let mut state = EditorUiState::default();
+        let doc_id = self.documents[self.active_doc].id;
+
+        egui::ScrollArea::vertical()
+            .id_salt(("editor", doc_id))
+            .show(ui, |ui| {
+                let doc = &mut self.documents[self.active_doc];
+                let output = egui::TextEdit::multiline(&mut doc.raw_markdown)
+                    .code_editor()
+                    .desired_width(f32::INFINITY)
+                    .desired_rows(12)
+                    .show(ui);
+                state.has_focus = output.response.has_focus();
+                if let Some(range) = output.cursor_range {
+                    state.cursor_char_index = Some(range.primary.index);
+                    state.has_selection = range.primary.index != range.secondary.index;
+                    let before = &doc.raw_markdown[..Self::byte_index_from_char_index(
+                        &doc.raw_markdown,
+                        range.primary.index,
+                    )];
+                    state.cursor_line = before.bytes().filter(|b| *b == b'\n').count();
+                }
+                if output.response.changed() {
+                    doc.rebuild_markdown(&self.settings);
+                    if let Some(index) = state.cursor_char_index {
+                        state.open_slash_args = Some((
+                            index,
+                            state.cursor_line,
+                            doc.raw_markdown.clone(),
+                            output.response.rect.left_bottom(),
+                        ));
+                    }
+                }
+            });
+
+        state
+    }
+
+    fn show_preview_pane(&mut self, ui: &mut egui::Ui) {
+        let math_cache = self.math_cache.clone();
+        let math_tx = self.math_tx.clone();
+        let mermaid_cache = self.mermaid_cache.clone();
+        let mermaid_tx = self.mermaid_tx.clone();
+        let render_math_enabled = self.settings.render_math;
+        let render_mermaid_enabled = self.settings.render_mermaid;
+
+        let line_height = ui.text_style_height(&TextStyle::Body) + ui.spacing().item_spacing.y;
+        let (doc_id, scroll_to_line) = {
+            let doc = &mut self.documents[self.active_doc];
+            (doc.id, doc.scroll_to_line.take())
+        };
+        let mut scroll_area = egui::ScrollArea::vertical().id_salt(("preview", doc_id));
+        if let Some(line) = scroll_to_line {
+            scroll_area = scroll_area.vertical_scroll_offset((line as f32) * line_height);
+        }
+
+        scroll_area.show(ui, |ui| {
+            let render_math_fn = move |ui: &mut egui::Ui, tex: &str, inline: bool| {
+                render_math(ui, tex, inline, &math_cache, &math_tx);
+            };
+            let render_html_fn = move |ui: &mut egui::Ui, html: &str| {
+                render_html(
+                    ui,
+                    html,
+                    render_mermaid_enabled,
+                    &mermaid_cache,
+                    &mermaid_tx,
+                );
+            };
+
+            let mut viewer = CommonMarkViewer::new();
+            if render_math_enabled {
+                viewer = viewer.render_math_fn(Some(&render_math_fn));
+            }
+            if render_mermaid_enabled {
+                viewer = viewer.render_html_fn(Some(&render_html_fn));
+            }
+
+            let doc = &mut self.documents[self.active_doc];
+            viewer.show(ui, &mut doc.commonmark_cache, &doc.markdown);
+        });
+    }
+
     fn dismiss_slash_menu(&mut self, remove_typed: bool, cursor_char_index: usize) {
         let settings = self.settings.clone();
         if remove_typed {
@@ -2373,207 +2488,261 @@ impl eframe::App for MarkdownViewerApp {
             self.pending_reloads.clear();
         }
 
-        egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
-            ui.vertical(|ui| {
-                ui.horizontal(|ui| {
-                    if ui.button("Open…").clicked() {
-                        self.open_dialog();
-                    }
-                    if ui.button("🖼 Upload image").clicked() {
-                        if let Some(files) = rfd::FileDialog::new()
-                            .add_filter("Images", &["png", "jpg", "jpeg", "gif", "webp", "svg"])
-                            .pick_files()
-                        {
-                            let mut pending = Vec::new();
-                            for path in files {
-                                if let Ok(bytes) = fs::read(&path) {
-                                    pending.push(PendingImage {
-                                        name: path
-                                            .file_name()
-                                            .map(|n| n.to_string_lossy().into_owned())
-                                            .unwrap_or_default(),
-                                        mime: infer_mime_from_path(&path),
-                                        bytes,
-                                    });
+        egui::TopBottomPanel::top("top_bar")
+            .frame(egui::Frame::new().inner_margin(egui::Margin::symmetric(8, 4)))
+            .show(ctx, |ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(8.0, 6.0);
+                ui.vertical(|ui| {
+                    ui.horizontal(|ui| {
+                        if ui.button("Open…").clicked() {
+                            self.open_dialog();
+                        }
+                        if ui.button("🖼 Upload image").clicked() {
+                            if let Some(files) = rfd::FileDialog::new()
+                                .add_filter("Images", &["png", "jpg", "jpeg", "gif", "webp", "svg"])
+                                .pick_files()
+                            {
+                                let mut pending = Vec::new();
+                                for path in files {
+                                    if let Ok(bytes) = fs::read(&path) {
+                                        pending.push(PendingImage {
+                                            name: path
+                                                .file_name()
+                                                .map(|n| n.to_string_lossy().into_owned())
+                                                .unwrap_or_default(),
+                                            mime: infer_mime_from_path(&path),
+                                            bytes,
+                                        });
+                                    }
+                                }
+                                self.process_images_for_active_doc(pending);
+                            }
+                        }
+                        ui.menu_button("Recent", |ui| {
+                            let recent = self.persisted.recent_files.clone();
+                            if recent.is_empty() {
+                                ui.weak("No recent files");
+                                return;
+                            }
+
+                            for path in recent {
+                                let exists = path.is_file();
+                                let label = path
+                                    .file_name()
+                                    .map(|n| n.to_string_lossy().into_owned())
+                                    .unwrap_or_else(|| path.display().to_string());
+
+                                if ui
+                                    .add_enabled(exists, egui::Button::new(label))
+                                    .on_hover_text(path.display().to_string())
+                                    .clicked()
+                                {
+                                    let _ = self.open_file(path);
+                                    ui.close();
                                 }
                             }
-                            self.process_images_for_active_doc(pending);
-                        }
-                    }
-                    ui.menu_button("Recent", |ui| {
-                        let recent = self.persisted.recent_files.clone();
-                        if recent.is_empty() {
-                            ui.weak("No recent files");
-                            return;
-                        }
 
-                        for path in recent {
-                            let exists = path.is_file();
-                            let label = path
-                                .file_name()
-                                .map(|n| n.to_string_lossy().into_owned())
-                                .unwrap_or_else(|| path.display().to_string());
-
-                            if ui
-                                .add_enabled(exists, egui::Button::new(label))
-                                .on_hover_text(path.display().to_string())
-                                .clicked()
-                            {
-                                let _ = self.open_file(path);
+                            ui.separator();
+                            if ui.button("Clear recent").clicked() {
+                                self.persisted.recent_files.clear();
                                 ui.close();
                             }
-                        }
-
-                        ui.separator();
-                        if ui.button("Clear recent").clicked() {
-                            self.persisted.recent_files.clear();
-                            ui.close();
-                        }
-                    });
-                    let reload_enabled = self
-                        .active_document()
-                        .and_then(|d| d.file_path.as_ref())
-                        .is_some();
-                    if ui
-                        .add_enabled(reload_enabled, egui::Button::new("Reload"))
-                        .clicked()
-                    {
-                        self.reload_active();
-                    }
-                    if ui.button("Find…").on_hover_text("Ctrl+F").clicked() {
-                        self.find.open = true;
-                        self.find.focus_query = true;
-                    }
-
-                    ui.separator();
-
-                    let mut auto_reload_changed = false;
-                    ui.menu_button("Options", |ui| {
-                        let mut changed = false;
-                        changed |= ui
-                            .checkbox(
-                                &mut self.settings.render_math,
-                                "Render math ($...$ / $$...$$)",
-                            )
-                            .changed();
-                        changed |= ui
-                            .checkbox(&mut self.settings.render_mermaid, "Render Mermaid diagrams")
-                            .changed();
-                        ui.separator();
-                        ui.checkbox(&mut self.settings.show_outline, "Show outline panel");
-                        ui.checkbox(
-                            &mut self.settings.inline_render.enabled,
-                            "Inline live rendering (experimental)",
-                        );
-                        auto_reload_changed |= ui
-                            .checkbox(&mut self.settings.auto_reload, "Auto-reload changed files")
-                            .changed();
-                        ui.separator();
-                        changed |= ui
-                            .checkbox(
-                                &mut self.settings.auto_detect_code_lang,
-                                "Auto-detect code languages",
-                            )
-                            .changed();
-                        changed |= ui
-                            .checkbox(&mut self.settings.autolink_urls, "Autolink plain URLs")
-                            .changed();
-                        changed |= ui
-                            .checkbox(
-                                &mut self.settings.github_links,
-                                "GitHub issue/PR links (#123)",
-                            )
-                            .changed();
-                        changed |= ui
-                            .checkbox(
-                                &mut self.settings.replace_emoji,
-                                "Emoji shortcodes (:smile:)",
-                            )
-                            .changed();
-                        changed |= ui
-                            .checkbox(
-                                &mut self.settings.smart_typography,
-                                "Smart typography (off by default)",
-                            )
-                            .changed();
-                        ui.separator();
-                        ui.label("Image storage mode");
-                        ui.horizontal(|ui| {
-                            ui.selectable_value(
-                                &mut self.image_config.storage_mode,
-                                ImageStorageMode::Local,
-                                "Local",
-                            );
-                            ui.selectable_value(
-                                &mut self.image_config.storage_mode,
-                                ImageStorageMode::Base64,
-                                "Base64",
-                            );
-                            ui.selectable_value(
-                                &mut self.image_config.storage_mode,
-                                ImageStorageMode::Remote,
-                                "Remote",
-                            );
                         });
-                        if changed {
-                            self.rebuild_all_markdown();
+                        let reload_enabled = self
+                            .active_document()
+                            .and_then(|d| d.file_path.as_ref())
+                            .is_some();
+                        if ui
+                            .add_enabled(reload_enabled, egui::Button::new("Reload"))
+                            .clicked()
+                        {
+                            self.reload_active();
                         }
-                    });
-                    if auto_reload_changed {
-                        self.update_watched_paths();
-                    }
-
-                    ui.separator();
-
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let theme_before = self.settings.theme;
-                        ui.selectable_value(
-                            &mut self.settings.theme,
-                            AppTheme::TerminalAmber,
-                            egui::RichText::new("A>")
-                                .monospace()
-                                .color(egui::Color32::from_rgb(0xff, 0xb0, 0x36)),
-                        )
-                        .on_hover_text("Amber terminal theme");
-                        ui.selectable_value(
-                            &mut self.settings.theme,
-                            AppTheme::TerminalGreen,
-                            egui::RichText::new("G>")
-                                .monospace()
-                                .color(egui::Color32::from_rgb(0x00, 0xff, 0x7a)),
-                        )
-                        .on_hover_text("Green terminal theme");
-                        ui.selectable_value(&mut self.settings.theme, AppTheme::Light, "☀")
-                            .on_hover_text("Light theme");
-                        ui.selectable_value(&mut self.settings.theme, AppTheme::Dark, "🌙")
-                            .on_hover_text("Dark theme");
-                        ui.selectable_value(&mut self.settings.theme, AppTheme::System, "💻")
-                            .on_hover_text("Follow the system theme");
-                        if theme_before != self.settings.theme {
-                            apply_app_theme(ctx, self.settings.theme);
-                            self.clear_render_caches();
+                        if ui.button("Find…").on_hover_text("Ctrl+F").clicked() {
+                            self.find.open = true;
+                            self.find.focus_query = true;
                         }
 
                         ui.separator();
 
-                        match self
-                            .active_document()
-                            .and_then(|doc| doc.file_path.as_ref())
-                        {
-                            Some(path) => {
-                                ui.add(egui::Label::new(path.display().to_string()).truncate());
-                            }
-                            None => {
-                                ui.weak("No file loaded");
-                            }
-                        }
-                    });
-                });
+                        ui.label("View");
+                        ui.selectable_value(
+                            &mut self.settings.view_mode,
+                            ViewMode::EditorOnly,
+                            "Editor",
+                        );
+                        ui.selectable_value(&mut self.settings.view_mode, ViewMode::Split, "Split");
+                        ui.selectable_value(
+                            &mut self.settings.view_mode,
+                            ViewMode::PreviewOnly,
+                            "Preview",
+                        );
 
-                ui.add_space(4.0);
-                self.show_tab_bar(ui);
+                        ui.separator();
+
+                        let mut auto_reload_changed = false;
+                        ui.menu_button("Options", |ui| {
+                            let mut changed = false;
+                            changed |= ui
+                                .checkbox(
+                                    &mut self.settings.render_math,
+                                    "Render math ($...$ / $$...$$)",
+                                )
+                                .changed();
+                            changed |= ui
+                                .checkbox(
+                                    &mut self.settings.render_mermaid,
+                                    "Render Mermaid diagrams",
+                                )
+                                .changed();
+                            ui.separator();
+                            ui.checkbox(&mut self.settings.show_outline, "Show outline panel");
+                            ui.checkbox(
+                                &mut self.settings.inline_render.enabled,
+                                "Inline live rendering (experimental)",
+                            );
+                            auto_reload_changed |= ui
+                                .checkbox(
+                                    &mut self.settings.auto_reload,
+                                    "Auto-reload changed files",
+                                )
+                                .changed();
+                            ui.separator();
+                            changed |= ui
+                                .checkbox(
+                                    &mut self.settings.auto_detect_code_lang,
+                                    "Auto-detect code languages",
+                                )
+                                .changed();
+                            changed |= ui
+                                .checkbox(&mut self.settings.autolink_urls, "Autolink plain URLs")
+                                .changed();
+                            changed |= ui
+                                .checkbox(
+                                    &mut self.settings.github_links,
+                                    "GitHub issue/PR links (#123)",
+                                )
+                                .changed();
+                            changed |= ui
+                                .checkbox(
+                                    &mut self.settings.replace_emoji,
+                                    "Emoji shortcodes (:smile:)",
+                                )
+                                .changed();
+                            changed |= ui
+                                .checkbox(
+                                    &mut self.settings.smart_typography,
+                                    "Smart typography (off by default)",
+                                )
+                                .changed();
+                            ui.separator();
+                            ui.label("Image storage mode");
+                            ui.horizontal(|ui| {
+                                ui.selectable_value(
+                                    &mut self.image_config.storage_mode,
+                                    ImageStorageMode::Local,
+                                    "Local",
+                                );
+                                ui.selectable_value(
+                                    &mut self.image_config.storage_mode,
+                                    ImageStorageMode::Base64,
+                                    "Base64",
+                                );
+                                ui.selectable_value(
+                                    &mut self.image_config.storage_mode,
+                                    ImageStorageMode::Remote,
+                                    "Remote",
+                                );
+                            });
+                            if changed {
+                                self.rebuild_all_markdown();
+                            }
+                        });
+                        if auto_reload_changed {
+                            self.update_watched_paths();
+                        }
+
+                        ui.separator();
+
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let theme_before = self.settings.theme;
+                            ui.menu_button("Theme", |ui| {
+                                let mut changed = false;
+                                changed |= ui
+                                    .selectable_value(
+                                        &mut self.settings.theme,
+                                        AppTheme::System,
+                                        "💻 System",
+                                    )
+                                    .on_hover_text("Follow the system theme")
+                                    .changed();
+                                changed |= ui
+                                    .selectable_value(
+                                        &mut self.settings.theme,
+                                        AppTheme::Dark,
+                                        "🌙 Dark",
+                                    )
+                                    .on_hover_text("Dark theme")
+                                    .changed();
+                                changed |= ui
+                                    .selectable_value(
+                                        &mut self.settings.theme,
+                                        AppTheme::Light,
+                                        "☀ Light",
+                                    )
+                                    .on_hover_text("Light theme")
+                                    .changed();
+                                changed |= ui
+                                    .selectable_value(
+                                        &mut self.settings.theme,
+                                        AppTheme::TerminalGreen,
+                                        egui::RichText::new("G> Terminal Green")
+                                            .monospace()
+                                            .color(egui::Color32::from_rgb(0x00, 0xff, 0x7a)),
+                                    )
+                                    .on_hover_text("Green terminal theme")
+                                    .changed();
+                                changed |= ui
+                                    .selectable_value(
+                                        &mut self.settings.theme,
+                                        AppTheme::TerminalAmber,
+                                        egui::RichText::new("A> Terminal Amber")
+                                            .monospace()
+                                            .color(egui::Color32::from_rgb(0xff, 0xb0, 0x36)),
+                                    )
+                                    .on_hover_text("Amber terminal theme")
+                                    .changed();
+                                if changed {
+                                    ui.close();
+                                }
+                            });
+                            if theme_before != self.settings.theme {
+                                apply_app_theme(ctx, self.settings.theme);
+                                self.clear_render_caches();
+                            }
+
+                            ui.separator();
+
+                            match self
+                                .active_document()
+                                .and_then(|doc| doc.file_path.as_ref())
+                            {
+                                Some(path) => {
+                                    let full_path = path.display().to_string();
+                                    let truncated = left_truncate(&full_path, 72);
+                                    ui.label(truncated).on_hover_text(full_path);
+                                }
+                                None => {
+                                    ui.weak("No file loaded");
+                                }
+                            }
+                        });
+                    });
+
+                    ui.add_space(4.0);
+                    self.show_tab_bar(ui);
+                });
             });
-        });
 
         if self.settings.show_outline {
             let outline = self
@@ -2585,9 +2754,19 @@ impl eframe::App for MarkdownViewerApp {
             egui::SidePanel::left("outline_panel")
                 .resizable(true)
                 .default_width(220.0)
+                .frame(egui::Frame::new().inner_margin(egui::Margin::symmetric(8, 6)))
                 .show(ctx, |ui| {
+                    ui.spacing_mut().item_spacing = egui::vec2(8.0, 6.0);
                     ui.horizontal(|ui| {
-                        ui.heading("Outline");
+                        let heading = ui
+                            .add(
+                                egui::Label::new(egui::RichText::new("Outline").heading())
+                                    .sense(egui::Sense::click()),
+                            )
+                            .on_hover_text("Scroll to top");
+                        if heading.clicked() {
+                            jump_to_line = Some(0);
+                        }
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui.button("×").on_hover_text("Hide outline").clicked() {
                                 self.settings.show_outline = false;
@@ -2595,11 +2774,6 @@ impl eframe::App for MarkdownViewerApp {
                         });
                     });
                     ui.separator();
-
-                    if ui.button("Top").clicked() {
-                        jump_to_line = Some(0);
-                    }
-                    ui.add_space(4.0);
 
                     if outline.is_empty() {
                         ui.weak("No headings");
@@ -2611,7 +2785,10 @@ impl eframe::App for MarkdownViewerApp {
                             ui.horizontal(|ui| {
                                 ui.add_space(((item.level.saturating_sub(1)) as f32) * 12.0);
                                 if ui
-                                    .selectable_label(false, &item.title)
+                                    .selectable_label(
+                                        false,
+                                        outline_item_label(item.level, &item.title),
+                                    )
                                     .on_hover_text(format!(
                                         "Line {}\n#{}",
                                         item.line + 1,
@@ -2622,6 +2799,7 @@ impl eframe::App for MarkdownViewerApp {
                                     jump_to_line = Some(item.line);
                                 }
                             });
+                            ui.add_space(2.0);
                         }
                     });
                 });
@@ -2635,247 +2813,215 @@ impl eframe::App for MarkdownViewerApp {
 
         self.handle_smart_paste_shortcuts(ctx);
 
-        egui::CentralPanel::default().show(ctx, |ui| {
-            if let Some(err) = &self.error {
-                ui.colored_label(ui.visuals().error_fg_color, err);
-                ui.separator();
-            }
-
-            let math_cache = self.math_cache.clone();
-            let math_tx = self.math_tx.clone();
-            let mermaid_cache = self.mermaid_cache.clone();
-            let mermaid_tx = self.mermaid_tx.clone();
-            let render_math_enabled = self.settings.render_math;
-            let render_mermaid_enabled = self.settings.render_mermaid;
-
-            if self.documents.get(self.active_doc).is_none() {
-                ui.weak("No documents open");
-                return;
-            }
-
-            if self.settings.inline_render.enabled {
-                self.show_inline_surface(ui, ctx);
-                return;
-            }
-
-            let editor_has_focus;
-            let mut cursor_char_index = None::<usize>;
-            let mut cursor_line = 0usize;
-            let mut has_selection = false;
-            let mut open_slash_args = None::<(usize, usize, String, egui::Pos2)>;
-            {
-                let doc = &mut self.documents[self.active_doc];
-                let output = egui::TextEdit::multiline(&mut doc.raw_markdown)
-                    .code_editor()
-                    .desired_width(f32::INFINITY)
-                    .desired_rows(12)
-                    .show(ui);
-                editor_has_focus = output.response.has_focus();
-                if let Some(range) = output.cursor_range {
-                    cursor_char_index = Some(range.primary.index);
-                    has_selection = range.primary.index != range.secondary.index;
-                    let before = &doc.raw_markdown[..Self::byte_index_from_char_index(
-                        &doc.raw_markdown,
-                        range.primary.index,
-                    )];
-                    cursor_line = before.bytes().filter(|b| *b == b'\n').count();
+        egui::CentralPanel::default()
+            .frame(egui::Frame::new().inner_margin(egui::Margin::symmetric(8, 6)))
+            .show(ctx, |ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(8.0, 6.0);
+                if let Some(err) = &self.error {
+                    ui.colored_label(ui.visuals().error_fg_color, err);
+                    ui.separator();
                 }
-                if output.response.changed() {
-                    doc.rebuild_markdown(&self.settings);
-                    if let Some(index) = cursor_char_index {
-                        open_slash_args = Some((
-                            index,
-                            cursor_line,
-                            doc.raw_markdown.clone(),
-                            output.response.rect.left_bottom(),
-                        ));
+
+                if self.documents.get(self.active_doc).is_none() {
+                    ui.weak("No documents open");
+                    return;
+                }
+
+                if self.settings.inline_render.enabled
+                    && matches!(self.settings.view_mode, ViewMode::EditorOnly)
+                {
+                    self.show_inline_surface(ui, ctx);
+                    return;
+                }
+
+                let show_editor = matches!(
+                    self.settings.view_mode,
+                    ViewMode::EditorOnly | ViewMode::Split
+                );
+                let mut editor_state = EditorUiState::default();
+
+                match self.settings.view_mode {
+                    ViewMode::EditorOnly => {
+                        editor_state = self.show_editor_pane(ui);
+                    }
+                    ViewMode::Split => {
+                        ui.columns(2, |cols| {
+                            cols[0].spacing_mut().item_spacing = egui::vec2(8.0, 6.0);
+                            cols[1].spacing_mut().item_spacing = egui::vec2(8.0, 6.0);
+                            editor_state = self.show_editor_pane(&mut cols[0]);
+                            self.show_preview_pane(&mut cols[1]);
+                        });
+                    }
+                    ViewMode::PreviewOnly => {
+                        self.show_preview_pane(ui);
                     }
                 }
-            }
-            self.editor_has_focus = editor_has_focus;
-            if let Some((index, line, text, anchor)) = open_slash_args {
-                self.maybe_open_slash_menu(index, line, &text, anchor);
-            }
 
-            if self.slash_menu.open {
-                if let Some(index) = cursor_char_index {
-                    if cursor_line != self.slash_menu.trigger_line {
-                        self.dismiss_slash_menu(false, index);
-                    } else if let Some(doc) = self.active_document() {
-                        let start = Self::byte_index_from_char_index(
-                            &doc.raw_markdown,
-                            self.slash_menu.trigger_char_index + 1,
-                        );
-                        let end = Self::byte_index_from_char_index(&doc.raw_markdown, index);
-                        if start <= end && end <= doc.raw_markdown.len() {
-                            self.slash_menu.query = doc.raw_markdown[start..end].to_string();
+                self.editor_has_focus = show_editor && editor_state.has_focus;
+
+                if show_editor {
+                    if let Some((index, line, text, anchor)) = editor_state.open_slash_args {
+                        self.maybe_open_slash_menu(index, line, &text, anchor);
+                    }
+
+                    if self.slash_menu.open {
+                        if let Some(index) = editor_state.cursor_char_index {
+                            if editor_state.cursor_line != self.slash_menu.trigger_line {
+                                self.dismiss_slash_menu(false, index);
+                            } else if let Some(doc) = self.active_document() {
+                                let start = Self::byte_index_from_char_index(
+                                    &doc.raw_markdown,
+                                    self.slash_menu.trigger_char_index + 1,
+                                );
+                                let end =
+                                    Self::byte_index_from_char_index(&doc.raw_markdown, index);
+                                if start <= end && end <= doc.raw_markdown.len() {
+                                    self.slash_menu.query =
+                                        doc.raw_markdown[start..end].to_string();
+                                }
+                            }
                         }
                     }
-                }
-            }
 
-            if self.slash_menu.open {
-                let matches = self.slash_matches(has_selection);
-                if matches.len() == 1 {
-                    self.slash_menu.selected_idx = 0;
-                } else if self.slash_menu.selected_idx >= matches.len() {
-                    self.slash_menu.selected_idx = 0;
-                }
+                    if self.slash_menu.open {
+                        let matches = self.slash_matches(editor_state.has_selection);
+                        if matches.len() == 1 {
+                            self.slash_menu.selected_idx = 0;
+                        } else if self.slash_menu.selected_idx >= matches.len() {
+                            self.slash_menu.selected_idx = 0;
+                        }
 
-                let mut dismiss_escape = false;
-                let mut execute = false;
-                let mut move_next = false;
-                let mut move_prev = false;
-                let mut dismiss_on_space = false;
-                ctx.input(|i| {
-                    dismiss_escape = i.key_pressed(egui::Key::Escape);
-                    execute = i.key_pressed(egui::Key::Enter);
-                    move_next = i.key_pressed(egui::Key::ArrowDown)
-                        || i.key_pressed(egui::Key::Tab) && !i.modifiers.shift;
-                    move_prev = i.key_pressed(egui::Key::ArrowUp)
-                        || (i.key_pressed(egui::Key::Tab) && i.modifiers.shift);
-                    dismiss_on_space = i.key_pressed(egui::Key::Space) && matches.is_empty();
-                });
-                if move_next && !matches.is_empty() {
-                    self.slash_menu.selected_idx =
-                        (self.slash_menu.selected_idx + 1) % matches.len();
-                }
-                if move_prev && !matches.is_empty() {
-                    self.slash_menu.selected_idx = if self.slash_menu.selected_idx == 0 {
-                        matches.len() - 1
-                    } else {
-                        self.slash_menu.selected_idx - 1
-                    };
-                }
-                if dismiss_escape {
-                    if let Some(index) = cursor_char_index {
-                        self.dismiss_slash_menu(true, index);
+                        let mut dismiss_escape = false;
+                        let mut execute = false;
+                        let mut move_next = false;
+                        let mut move_prev = false;
+                        let mut dismiss_on_space = false;
+                        ctx.input(|i| {
+                            dismiss_escape = i.key_pressed(egui::Key::Escape);
+                            execute = i.key_pressed(egui::Key::Enter);
+                            move_next = i.key_pressed(egui::Key::ArrowDown)
+                                || i.key_pressed(egui::Key::Tab) && !i.modifiers.shift;
+                            move_prev = i.key_pressed(egui::Key::ArrowUp)
+                                || (i.key_pressed(egui::Key::Tab) && i.modifiers.shift);
+                            dismiss_on_space =
+                                i.key_pressed(egui::Key::Space) && matches.is_empty();
+                        });
+                        if move_next && !matches.is_empty() {
+                            self.slash_menu.selected_idx =
+                                (self.slash_menu.selected_idx + 1) % matches.len();
+                        }
+                        if move_prev && !matches.is_empty() {
+                            self.slash_menu.selected_idx = if self.slash_menu.selected_idx == 0 {
+                                matches.len() - 1
+                            } else {
+                                self.slash_menu.selected_idx - 1
+                            };
+                        }
+                        if dismiss_escape {
+                            if let Some(index) = editor_state.cursor_char_index {
+                                self.dismiss_slash_menu(true, index);
+                            }
+                        } else if dismiss_on_space {
+                            self.slash_menu.open = false;
+                        } else if execute {
+                            if let (Some(index), Some(entry)) = (
+                                editor_state.cursor_char_index,
+                                matches.get(self.slash_menu.selected_idx),
+                            ) {
+                                let cmd = self.slash_commands[entry.cmd_idx].clone();
+                                self.execute_slash_command(&cmd, index);
+                            }
+                        }
+
+                        if self.slash_menu.open {
+                            let mut clicked_cmd: Option<SlashCommand> = None;
+                            let frame = egui::Frame::popup(ui.style())
+                                .corner_radius(egui::CornerRadius::same(4))
+                                .shadow(egui::epaint::Shadow {
+                                    offset: [0, 4],
+                                    blur: 12,
+                                    spread: 0,
+                                    color: egui::Color32::from_black_alpha(26),
+                                });
+                            egui::Area::new("slash_menu".into())
+                                .order(egui::Order::Foreground)
+                                .fixed_pos(self.slash_menu.anchor + egui::vec2(0.0, 4.0))
+                                .show(ctx, |ui| {
+                                    frame.show(ui, |ui| {
+                                        ui.set_min_width(280.0);
+                                        ui.set_max_width(360.0);
+                                        ui.set_max_height(340.0);
+                                        if matches.is_empty() {
+                                            ui.weak("No commands found");
+                                        } else {
+                                            egui::ScrollArea::vertical().max_height(340.0).show(
+                                                ui,
+                                                |ui| {
+                                                    for (i, m) in matches.iter().enumerate() {
+                                                        let cmd =
+                                                            self.slash_commands[m.cmd_idx].clone();
+                                                        let selected =
+                                                            i == self.slash_menu.selected_idx;
+                                                        let mut label =
+                                                            egui::RichText::new(cmd.name);
+                                                        if selected {
+                                                            label = label.strong();
+                                                        }
+                                                        let row =
+                                                            ui.selectable_label(selected, label);
+                                                        if row.clicked() {
+                                                            clicked_cmd = Some(cmd.clone());
+                                                        }
+                                                        if self.slash_config.show_descriptions {
+                                                            ui.small(
+                                                                egui::RichText::new(
+                                                                    cmd.description,
+                                                                )
+                                                                .weak(),
+                                                            );
+                                                        }
+                                                        ui.add_space(2.0);
+                                                    }
+                                                },
+                                            );
+                                        }
+                                    });
+                                });
+                            if let (Some(index), Some(cmd)) =
+                                (editor_state.cursor_char_index, clicked_cmd)
+                            {
+                                self.execute_slash_command(&cmd, index);
+                            }
+                        }
                     }
-                } else if dismiss_on_space {
+                } else {
                     self.slash_menu.open = false;
-                } else if execute {
-                    if let (Some(index), Some(entry)) =
-                        (cursor_char_index, matches.get(self.slash_menu.selected_idx))
-                    {
-                        let cmd = self.slash_commands[entry.cmd_idx].clone();
-                        self.execute_slash_command(&cmd, index);
-                    }
+                    self.slash_menu.query.clear();
                 }
 
-                if self.slash_menu.open {
-                    let mut clicked_cmd: Option<SlashCommand> = None;
-                    let frame = egui::Frame::popup(ui.style())
-                        .corner_radius(egui::CornerRadius::same(4))
-                        .shadow(egui::epaint::Shadow {
-                            offset: [0, 4],
-                            blur: 12,
-                            spread: 0,
-                            color: egui::Color32::from_black_alpha(26),
-                        });
-                    egui::Area::new("slash_menu".into())
-                        .order(egui::Order::Foreground)
-                        .fixed_pos(self.slash_menu.anchor + egui::vec2(0.0, 4.0))
-                        .show(ctx, |ui| {
-                            frame.show(ui, |ui| {
-                                ui.set_min_width(280.0);
-                                ui.set_max_width(360.0);
-                                ui.set_max_height(340.0);
-                                if matches.is_empty() {
-                                    ui.weak("No commands found");
-                                } else {
-                                    egui::ScrollArea::vertical()
-                                        .max_height(340.0)
-                                        .show(ui, |ui| {
-                                            for (i, m) in matches.iter().enumerate() {
-                                                let cmd = self.slash_commands[m.cmd_idx].clone();
-                                                let selected = i == self.slash_menu.selected_idx;
-                                                let mut label = egui::RichText::new(cmd.name);
-                                                if selected {
-                                                    label = label.strong();
-                                                }
-                                                let row = ui.selectable_label(selected, label);
-                                                if row.clicked() {
-                                                    clicked_cmd = Some(cmd.clone());
-                                                }
-                                                if self.slash_config.show_descriptions {
-                                                    ui.small(
-                                                        egui::RichText::new(cmd.description).weak(),
-                                                    );
-                                                }
-                                                ui.add_space(2.0);
-                                            }
-                                        });
-                                }
-                            });
-                        });
-                    if let (Some(index), Some(cmd)) = (cursor_char_index, clicked_cmd) {
-                        self.execute_slash_command(&cmd, index);
-                    }
-                }
-            }
-
-            ui.separator();
-            ui.label("Preview");
-
-            let line_height = ui.text_style_height(&TextStyle::Body) + ui.spacing().item_spacing.y;
-            let (doc_id, scroll_to_line) = {
-                let doc = &mut self.documents[self.active_doc];
-                (doc.id, doc.scroll_to_line.take())
-            };
-            let mut scroll_area = egui::ScrollArea::vertical().id_salt(doc_id);
-            if let Some(line) = scroll_to_line {
-                scroll_area = scroll_area.vertical_scroll_offset((line as f32) * line_height);
-            }
-
-            scroll_area.show(ui, |ui| {
-                let render_math_fn = move |ui: &mut egui::Ui, tex: &str, inline: bool| {
-                    render_math(ui, tex, inline, &math_cache, &math_tx);
-                };
-                let render_html_fn = move |ui: &mut egui::Ui, html: &str| {
-                    render_html(
-                        ui,
-                        html,
-                        render_mermaid_enabled,
-                        &mermaid_cache,
-                        &mermaid_tx,
+                if self.drop_zone_visible && self.editor_has_focus {
+                    let rect = ui.max_rect();
+                    let painter = ui.painter();
+                    painter.rect_filled(
+                        rect,
+                        egui::CornerRadius::same(8),
+                        egui::Color32::from_rgba_unmultiplied(59, 130, 246, 20),
                     );
-                };
-
-                let mut viewer = CommonMarkViewer::new();
-                if render_math_enabled {
-                    viewer = viewer.render_math_fn(Some(&render_math_fn));
+                    painter.rect_stroke(
+                        rect.shrink(4.0),
+                        egui::CornerRadius::same(8),
+                        egui::Stroke::new(2.0, egui::Color32::from_rgb(59, 130, 246)),
+                        egui::StrokeKind::Middle,
+                    );
+                    painter.text(
+                        rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        "🖼 Drop image here",
+                        egui::TextStyle::Heading.resolve(ui.style()),
+                        egui::Color32::from_rgb(59, 130, 246),
+                    );
                 }
-                if render_mermaid_enabled {
-                    viewer = viewer.render_html_fn(Some(&render_html_fn));
-                }
-
-                let doc = &mut self.documents[self.active_doc];
-                viewer.show(ui, &mut doc.commonmark_cache, &doc.markdown);
             });
-
-            if self.drop_zone_visible && self.editor_has_focus {
-                let rect = ui.max_rect();
-                let painter = ui.painter();
-                painter.rect_filled(
-                    rect,
-                    egui::CornerRadius::same(8),
-                    egui::Color32::from_rgba_unmultiplied(59, 130, 246, 20),
-                );
-                painter.rect_stroke(
-                    rect.shrink(4.0),
-                    egui::CornerRadius::same(8),
-                    egui::Stroke::new(2.0, egui::Color32::from_rgb(59, 130, 246)),
-                    egui::StrokeKind::Middle,
-                );
-                painter.text(
-                    rect.center(),
-                    egui::Align2::CENTER_CENTER,
-                    "🖼 Drop image here",
-                    egui::TextStyle::Heading.resolve(ui.style()),
-                    egui::Color32::from_rgb(59, 130, 246),
-                );
-            }
-        });
 
         self.show_find_window(ctx);
         self.handle_internal_anchor_links(ctx);
@@ -2929,6 +3075,19 @@ enum AppTheme {
 impl Default for AppTheme {
     fn default() -> Self {
         Self::System
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+enum ViewMode {
+    EditorOnly,
+    Split,
+    PreviewOnly,
+}
+
+impl Default for ViewMode {
+    fn default() -> Self {
+        Self::PreviewOnly
     }
 }
 
@@ -3129,6 +3288,7 @@ fn parse_github_remote(remote: &str) -> Option<String> {
 #[serde(default)]
 struct ViewerSettings {
     theme: AppTheme,
+    view_mode: ViewMode,
     render_math: bool,
     render_mermaid: bool,
     auto_detect_code_lang: bool,
@@ -3145,6 +3305,7 @@ impl Default for ViewerSettings {
     fn default() -> Self {
         Self {
             theme: AppTheme::System,
+            view_mode: ViewMode::PreviewOnly,
             render_math: true,
             render_mermaid: true,
             auto_detect_code_lang: true,
