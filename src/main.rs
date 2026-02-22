@@ -2493,96 +2493,198 @@ impl eframe::App for MarkdownViewerApp {
             .show(ctx, |ui| {
                 ui.spacing_mut().item_spacing = egui::vec2(8.0, 6.0);
                 ui.vertical(|ui| {
-                    ui.horizontal(|ui| {
-                        if ui.button("Open…").clicked() {
-                            self.open_dialog();
-                        }
-                        if ui.button("🖼 Upload image").clicked() {
-                            if let Some(files) = rfd::FileDialog::new()
-                                .add_filter("Images", &["png", "jpg", "jpeg", "gif", "webp", "svg"])
-                                .pick_files()
+                    let mut auto_reload_changed = false;
+                    egui::menu::bar(ui, |ui| {
+                        ui.menu_button("File", |ui| {
+                            if ui
+                                .add(
+                                    egui::Button::new("Open…")
+                                        .shortcut_text("Ctrl+O"),
+                                )
+                                .clicked()
                             {
-                                let mut pending = Vec::new();
-                                for path in files {
-                                    if let Ok(bytes) = fs::read(&path) {
-                                        pending.push(PendingImage {
-                                            name: path
-                                                .file_name()
-                                                .map(|n| n.to_string_lossy().into_owned())
-                                                .unwrap_or_default(),
-                                            mime: infer_mime_from_path(&path),
-                                            bytes,
-                                        });
-                                    }
-                                }
-                                self.process_images_for_active_doc(pending);
-                            }
-                        }
-                        ui.menu_button("Recent", |ui| {
-                            let recent = self.persisted.recent_files.clone();
-                            if recent.is_empty() {
-                                ui.weak("No recent files");
-                                return;
+                                self.open_dialog();
+                                ui.close();
                             }
 
-                            for path in recent {
-                                let exists = path.is_file();
-                                let label = path
-                                    .file_name()
-                                    .map(|n| n.to_string_lossy().into_owned())
-                                    .unwrap_or_else(|| path.display().to_string());
-
-                                if ui
-                                    .add_enabled(exists, egui::Button::new(label))
-                                    .on_hover_text(path.display().to_string())
-                                    .clicked()
+                            if ui
+                                .add(
+                                    egui::Button::new("Upload image…")
+                                        .shortcut_text("Ctrl+Shift+I"),
+                                )
+                                .clicked()
+                            {
+                                if let Some(files) = rfd::FileDialog::new()
+                                    .add_filter(
+                                        "Images",
+                                        &["png", "jpg", "jpeg", "gif", "webp", "svg"],
+                                    )
+                                    .pick_files()
                                 {
-                                    let _ = self.open_file(path);
-                                    ui.close();
+                                    let mut pending = Vec::new();
+                                    for path in files {
+                                        if let Ok(bytes) = fs::read(&path) {
+                                            pending.push(PendingImage {
+                                                name: path
+                                                    .file_name()
+                                                    .map(|n| n.to_string_lossy().into_owned())
+                                                    .unwrap_or_default(),
+                                                mime: infer_mime_from_path(&path),
+                                                bytes,
+                                            });
+                                        }
+                                    }
+                                    self.process_images_for_active_doc(pending);
                                 }
+                                ui.close();
                             }
 
                             ui.separator();
-                            if ui.button("Clear recent").clicked() {
-                                self.persisted.recent_files.clear();
+
+                            ui.menu_button("Recent", |ui| {
+                                let recent = self.persisted.recent_files.clone();
+                                if recent.is_empty() {
+                                    ui.weak("No recent files");
+                                    return;
+                                }
+
+                                for path in recent {
+                                    let exists = path.is_file();
+                                    let label = path
+                                        .file_name()
+                                        .map(|n| n.to_string_lossy().into_owned())
+                                        .unwrap_or_else(|| path.display().to_string());
+
+                                    if ui
+                                        .add_enabled(exists, egui::Button::new(label))
+                                        .on_hover_text(path.display().to_string())
+                                        .clicked()
+                                    {
+                                        let _ = self.open_file(path);
+                                        ui.close();
+                                    }
+                                }
+
+                                ui.separator();
+                                if ui.button("Clear recent").clicked() {
+                                    self.persisted.recent_files.clear();
+                                    ui.close();
+                                }
+                            });
+
+                            ui.separator();
+
+                            let reload_enabled = self
+                                .active_document()
+                                .and_then(|d| d.file_path.as_ref())
+                                .is_some();
+                            if ui
+                                .add_enabled(reload_enabled, egui::Button::new("Reload"))
+                                .clicked()
+                            {
+                                self.reload_active();
+                                ui.close();
+                            }
+
+                            auto_reload_changed |= ui
+                                .checkbox(
+                                    &mut self.settings.auto_reload,
+                                    "Auto-reload changed files",
+                                )
+                                .changed();
+                        });
+
+                        ui.menu_button("Edit", |ui| {
+                            if ui
+                                .add(
+                                    egui::Button::new("Find…")
+                                        .shortcut_text("Ctrl+F"),
+                                )
+                                .clicked()
+                            {
+                                self.find.open = true;
+                                self.find.focus_query = true;
                                 ui.close();
                             }
                         });
-                        let reload_enabled = self
-                            .active_document()
-                            .and_then(|d| d.file_path.as_ref())
-                            .is_some();
-                        if ui
-                            .add_enabled(reload_enabled, egui::Button::new("Reload"))
-                            .clicked()
-                        {
-                            self.reload_active();
-                        }
-                        if ui.button("Find…").on_hover_text("Ctrl+F").clicked() {
-                            self.find.open = true;
-                            self.find.focus_query = true;
-                        }
 
-                        ui.separator();
+                        ui.menu_button("View", |ui| {
+                            let view_mode_before = self.settings.view_mode;
+                            ui.selectable_value(
+                                &mut self.settings.view_mode,
+                                ViewMode::EditorOnly,
+                                "Editor only",
+                            );
+                            ui.selectable_value(
+                                &mut self.settings.view_mode,
+                                ViewMode::Split,
+                                "Split view",
+                            );
+                            ui.selectable_value(
+                                &mut self.settings.view_mode,
+                                ViewMode::PreviewOnly,
+                                "Preview only",
+                            );
+                            if view_mode_before != self.settings.view_mode {
+                                ui.close();
+                            }
 
-                        ui.label("View");
-                        ui.selectable_value(
-                            &mut self.settings.view_mode,
-                            ViewMode::EditorOnly,
-                            "Editor",
-                        );
-                        ui.selectable_value(&mut self.settings.view_mode, ViewMode::Split, "Split");
-                        ui.selectable_value(
-                            &mut self.settings.view_mode,
-                            ViewMode::PreviewOnly,
-                            "Preview",
-                        );
+                            ui.separator();
+                            ui.checkbox(&mut self.settings.show_outline, "Show outline panel");
+                            ui.checkbox(
+                                &mut self.settings.inline_render.enabled,
+                                "Inline live rendering (experimental)",
+                            );
 
-                        ui.separator();
+                            ui.separator();
+                            ui.menu_button("Theme", |ui| {
+                                let theme_before = self.settings.theme;
+                                ui.selectable_value(
+                                    &mut self.settings.theme,
+                                    AppTheme::System,
+                                    "💻 System",
+                                )
+                                .on_hover_text("Follow the system theme");
+                                ui.selectable_value(
+                                    &mut self.settings.theme,
+                                    AppTheme::Dark,
+                                    "🌙 Dark",
+                                )
+                                .on_hover_text("Dark theme");
+                                ui.selectable_value(
+                                    &mut self.settings.theme,
+                                    AppTheme::Light,
+                                    "☀ Light",
+                                )
+                                .on_hover_text("Light theme");
+                                ui.selectable_value(
+                                    &mut self.settings.theme,
+                                    AppTheme::TerminalGreen,
+                                    egui::RichText::new("G> Terminal Green")
+                                        .monospace()
+                                        .color(egui::Color32::from_rgb(0x00, 0xff, 0x7a)),
+                                )
+                                .on_hover_text("Green terminal theme");
+                                ui.selectable_value(
+                                    &mut self.settings.theme,
+                                    AppTheme::TerminalAmber,
+                                    egui::RichText::new("A> Terminal Amber")
+                                        .monospace()
+                                        .color(egui::Color32::from_rgb(0xff, 0xb0, 0x36)),
+                                )
+                                .on_hover_text("Amber terminal theme");
 
-                        let mut auto_reload_changed = false;
+                                if theme_before != self.settings.theme {
+                                    apply_app_theme(ctx, self.settings.theme);
+                                    self.clear_render_caches();
+                                    ui.close();
+                                }
+                            });
+                        });
+
                         ui.menu_button("Options", |ui| {
                             let mut changed = false;
+                            ui.label(egui::RichText::new("Rendering").strong());
                             changed |= ui
                                 .checkbox(
                                     &mut self.settings.render_math,
@@ -2595,25 +2697,15 @@ impl eframe::App for MarkdownViewerApp {
                                     "Render Mermaid diagrams",
                                 )
                                 .changed();
-                            ui.separator();
-                            ui.checkbox(&mut self.settings.show_outline, "Show outline panel");
-                            ui.checkbox(
-                                &mut self.settings.inline_render.enabled,
-                                "Inline live rendering (experimental)",
-                            );
-                            auto_reload_changed |= ui
-                                .checkbox(
-                                    &mut self.settings.auto_reload,
-                                    "Auto-reload changed files",
-                                )
-                                .changed();
-                            ui.separator();
                             changed |= ui
                                 .checkbox(
                                     &mut self.settings.auto_detect_code_lang,
                                     "Auto-detect code languages",
                                 )
                                 .changed();
+
+                            ui.separator();
+                            ui.label(egui::RichText::new("Formatting").strong());
                             changed |= ui
                                 .checkbox(&mut self.settings.autolink_urls, "Autolink plain URLs")
                                 .changed();
@@ -2635,94 +2727,38 @@ impl eframe::App for MarkdownViewerApp {
                                     "Smart typography (off by default)",
                                 )
                                 .changed();
+
                             ui.separator();
+                            ui.label(egui::RichText::new("Images").strong());
                             ui.label("Image storage mode");
-                            ui.horizontal(|ui| {
-                                ui.selectable_value(
+                            changed |= ui
+                                .selectable_value(
                                     &mut self.image_config.storage_mode,
                                     ImageStorageMode::Local,
                                     "Local",
-                                );
-                                ui.selectable_value(
+                                )
+                                .changed();
+                            changed |= ui
+                                .selectable_value(
                                     &mut self.image_config.storage_mode,
                                     ImageStorageMode::Base64,
                                     "Base64",
-                                );
-                                ui.selectable_value(
+                                )
+                                .changed();
+                            changed |= ui
+                                .selectable_value(
                                     &mut self.image_config.storage_mode,
                                     ImageStorageMode::Remote,
                                     "Remote",
-                                );
-                            });
+                                )
+                                .changed();
+
                             if changed {
                                 self.rebuild_all_markdown();
                             }
                         });
-                        if auto_reload_changed {
-                            self.update_watched_paths();
-                        }
-
-                        ui.separator();
 
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            let theme_before = self.settings.theme;
-                            ui.menu_button("Theme", |ui| {
-                                let mut changed = false;
-                                changed |= ui
-                                    .selectable_value(
-                                        &mut self.settings.theme,
-                                        AppTheme::System,
-                                        "💻 System",
-                                    )
-                                    .on_hover_text("Follow the system theme")
-                                    .changed();
-                                changed |= ui
-                                    .selectable_value(
-                                        &mut self.settings.theme,
-                                        AppTheme::Dark,
-                                        "🌙 Dark",
-                                    )
-                                    .on_hover_text("Dark theme")
-                                    .changed();
-                                changed |= ui
-                                    .selectable_value(
-                                        &mut self.settings.theme,
-                                        AppTheme::Light,
-                                        "☀ Light",
-                                    )
-                                    .on_hover_text("Light theme")
-                                    .changed();
-                                changed |= ui
-                                    .selectable_value(
-                                        &mut self.settings.theme,
-                                        AppTheme::TerminalGreen,
-                                        egui::RichText::new("G> Terminal Green")
-                                            .monospace()
-                                            .color(egui::Color32::from_rgb(0x00, 0xff, 0x7a)),
-                                    )
-                                    .on_hover_text("Green terminal theme")
-                                    .changed();
-                                changed |= ui
-                                    .selectable_value(
-                                        &mut self.settings.theme,
-                                        AppTheme::TerminalAmber,
-                                        egui::RichText::new("A> Terminal Amber")
-                                            .monospace()
-                                            .color(egui::Color32::from_rgb(0xff, 0xb0, 0x36)),
-                                    )
-                                    .on_hover_text("Amber terminal theme")
-                                    .changed();
-                                if changed {
-                                    ui.close();
-                                }
-                            });
-                            if theme_before != self.settings.theme {
-                                apply_app_theme(ctx, self.settings.theme);
-                                self.clear_render_caches();
-                            }
-
-                            ui.separator();
-
                             match self
                                 .active_document()
                                 .and_then(|doc| doc.file_path.as_ref())
@@ -2738,6 +2774,9 @@ impl eframe::App for MarkdownViewerApp {
                             }
                         });
                     });
+                    if auto_reload_changed {
+                        self.update_watched_paths();
+                    }
 
                     ui.add_space(4.0);
                     self.show_tab_bar(ui);
