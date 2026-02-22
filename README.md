@@ -8,7 +8,7 @@ A Windows GUI Markdown file viewer written in Rust (built with `eframe`/`egui`).
 - Footnotes, definition lists, and GitHub-style callouts/admonitions
 - Math rendering (`$...$` / `$$...$$`) via MathJax → SVG
 - Mermaid diagrams via Kroki (` ```mermaid ` fences → SVG; requires internet)
-- Syntax highlighting + copy buttons (with best-effort language auto-detect)
+- Fenced code blocks with syntax highlighting for dozens of languages + copy buttons (best-effort language auto-detect)
 - Outline panel + in-document Find (Ctrl+F)
 - In-document heading links (e.g. `[Jump](#my-heading)`)
 - Light/Dark/System theme toggle

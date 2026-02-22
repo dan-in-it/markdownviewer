@@ -327,7 +327,11 @@ fn push_outline_item(
     line: usize,
 ) {
     let base = slugify_heading(&title);
-    let base = if base.is_empty() { "section".to_string() } else { base };
+    let base = if base.is_empty() {
+        "section".to_string()
+    } else {
+        base
+    };
     let slug = unique_slug(&base, used_slugs);
     outline.push(OutlineItem {
         level,
@@ -350,11 +354,7 @@ fn build_outline(markdown: &str) -> Vec<OutlineItem> {
         if (1..=6).contains(&hash_count) {
             let after_hashes = &trimmed[hash_count..];
             if after_hashes.starts_with([' ', '\t']) {
-                let title = after_hashes
-                    .trim()
-                    .trim_end_matches('#')
-                    .trim()
-                    .to_string();
+                let title = after_hashes.trim().trim_end_matches('#').trim().to_string();
                 if !title.is_empty() {
                     push_outline_item(&mut outline, &mut used_slugs, hash_count, title, idx);
                 }
@@ -387,27 +387,32 @@ enum WatchCommand {
     SetWatchedFiles(Vec<PathBuf>),
 }
 
-fn spawn_file_watcher(ctx: egui::Context, rx: mpsc::Receiver<WatchCommand>, tx: mpsc::Sender<PathBuf>) {
+fn spawn_file_watcher(
+    ctx: egui::Context,
+    rx: mpsc::Receiver<WatchCommand>,
+    tx: mpsc::Sender<PathBuf>,
+) {
     thread::spawn(move || {
         use notify::Watcher as _;
 
         let event_tx = tx.clone();
         let repaint_ctx = ctx.clone();
-        let mut watcher = match notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
-            let Ok(event) = res else {
-                return;
+        let mut watcher =
+            match notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+                let Ok(event) = res else {
+                    return;
+                };
+                for path in event.paths {
+                    let _ = event_tx.send(path);
+                }
+                repaint_ctx.request_repaint();
+            }) {
+                Ok(watcher) => watcher,
+                Err(err) => {
+                    eprintln!("file watcher disabled: {err}");
+                    return;
+                }
             };
-            for path in event.paths {
-                let _ = event_tx.send(path);
-            }
-            repaint_ctx.request_repaint();
-        }) {
-            Ok(watcher) => watcher,
-            Err(err) => {
-                eprintln!("file watcher disabled: {err}");
-                return;
-            }
-        };
 
         let mut watched_dirs = HashSet::<PathBuf>::new();
         while let Ok(cmd) = rx.recv() {
@@ -727,7 +732,11 @@ impl MarkdownViewerApp {
             || self.find.last_query != self.find.query
             || self.find.last_case_sensitive != self.find.case_sensitive
         {
-            self.find.matches = find_matches(&doc.raw_markdown, &self.find.query, self.find.case_sensitive);
+            self.find.matches = find_matches(
+                &doc.raw_markdown,
+                &self.find.query,
+                self.find.case_sensitive,
+            );
             self.find.selected = 0;
             self.find.last_doc_id = Some(doc_id);
             self.find.last_query = self.find.query.clone();
@@ -821,15 +830,17 @@ impl MarkdownViewerApp {
                     ));
                 }
 
-                egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
-                    for (idx, m) in matches.iter().enumerate() {
-                        let label = format!("{}:{}  {}", m.line + 1, m.col + 1, m.preview);
-                        if ui.selectable_label(idx == selected, label).clicked() {
-                            self.find.selected = idx;
-                            jump_to_line = Some(m.line);
+                egui::ScrollArea::vertical()
+                    .max_height(260.0)
+                    .show(ui, |ui| {
+                        for (idx, m) in matches.iter().enumerate() {
+                            let label = format!("{}:{}  {}", m.line + 1, m.col + 1, m.preview);
+                            if ui.selectable_label(idx == selected, label).clicked() {
+                                self.find.selected = idx;
+                                jump_to_line = Some(m.line);
+                            }
                         }
-                    }
-                });
+                    });
             });
 
         // Update cached results for changes made in the find window this frame.
@@ -867,7 +878,11 @@ impl MarkdownViewerApp {
     fn pump_watch_events(&mut self) {
         while let Ok(path) = self.watch_event_rx.try_recv() {
             let normalized = normalize_path(path.clone());
-            for doc_path in self.documents.iter().filter_map(|doc| doc.file_path.clone()) {
+            for doc_path in self
+                .documents
+                .iter()
+                .filter_map(|doc| doc.file_path.clone())
+            {
                 if doc_path == path || doc_path == normalized {
                     self.pending_reloads.insert(doc_path, Instant::now());
                 }
@@ -1245,37 +1260,25 @@ impl eframe::App for MarkdownViewerApp {
                         ui.selectable_value(
                             &mut self.settings.theme,
                             AppTheme::TerminalAmber,
-                            egui::RichText::new("A>").monospace().color(egui::Color32::from_rgb(
-                                0xff, 0xb0, 0x36,
-                            )),
+                            egui::RichText::new("A>")
+                                .monospace()
+                                .color(egui::Color32::from_rgb(0xff, 0xb0, 0x36)),
                         )
                         .on_hover_text("Amber terminal theme");
                         ui.selectable_value(
                             &mut self.settings.theme,
                             AppTheme::TerminalGreen,
-                            egui::RichText::new("G>").monospace().color(egui::Color32::from_rgb(
-                                0x00, 0xff, 0x7a,
-                            )),
+                            egui::RichText::new("G>")
+                                .monospace()
+                                .color(egui::Color32::from_rgb(0x00, 0xff, 0x7a)),
                         )
                         .on_hover_text("Green terminal theme");
-                        ui.selectable_value(
-                            &mut self.settings.theme,
-                            AppTheme::Light,
-                            "☀",
-                        )
-                        .on_hover_text("Light theme");
-                        ui.selectable_value(
-                            &mut self.settings.theme,
-                            AppTheme::Dark,
-                            "🌙",
-                        )
-                        .on_hover_text("Dark theme");
-                        ui.selectable_value(
-                            &mut self.settings.theme,
-                            AppTheme::System,
-                            "💻",
-                        )
-                        .on_hover_text("Follow the system theme");
+                        ui.selectable_value(&mut self.settings.theme, AppTheme::Light, "☀")
+                            .on_hover_text("Light theme");
+                        ui.selectable_value(&mut self.settings.theme, AppTheme::Dark, "🌙")
+                            .on_hover_text("Dark theme");
+                        ui.selectable_value(&mut self.settings.theme, AppTheme::System, "💻")
+                            .on_hover_text("Follow the system theme");
                         if theme_before != self.settings.theme {
                             apply_app_theme(ctx, self.settings.theme);
                             self.clear_render_caches();
@@ -1339,7 +1342,11 @@ impl eframe::App for MarkdownViewerApp {
                                 ui.add_space(((item.level.saturating_sub(1)) as f32) * 12.0);
                                 if ui
                                     .selectable_label(false, &item.title)
-                                    .on_hover_text(format!("Line {}\n#{}", item.line + 1, item.slug))
+                                    .on_hover_text(format!(
+                                        "Line {}\n#{}",
+                                        item.line + 1,
+                                        item.slug
+                                    ))
                                     .clicked()
                                 {
                                     jump_to_line = Some(item.line);
@@ -1417,9 +1424,7 @@ impl eframe::App for MarkdownViewerApp {
             .iter()
             .filter_map(|doc| doc.file_path.clone())
             .collect();
-        self.persisted.active_file = self
-            .active_document()
-            .and_then(|doc| doc.file_path.clone());
+        self.persisted.active_file = self.active_document().and_then(|doc| doc.file_path.clone());
         eframe::set_value(storage, STATE_KEY, &self.persisted);
     }
 }
@@ -1832,23 +1837,74 @@ fn normalize_fence_language(lang: &str) -> Option<String> {
     if lang.is_empty() {
         return None;
     }
+    let lang = lang
+        .trim_matches(|c| c == '{' || c == '}' || c == '.')
+        .strip_prefix("language-")
+        .unwrap_or(lang)
+        .trim();
     let lang_lc = lang.to_ascii_lowercase();
     let mapped = match lang_lc.as_str() {
+        // Core languages
         "rust" => "rs",
         "python" => "py",
         "javascript" | "js" => "js",
         "typescript" | "ts" => "ts",
+        "tsx" => "tsx",
+        "jsx" => "jsx",
         "bash" | "sh" | "shell" => "sh",
+        "zsh" | "fish" => "sh",
         "powershell" | "pwsh" => "ps1",
         "csharp" | "cs" => "cs",
         "cpp" | "c++" => "cpp",
         "c" => "c",
+        "h" => "h",
+        "h++" | "hpp" => "hpp",
+        "go" | "golang" => "go",
+        "java" => "java",
+        "kotlin" | "kt" | "kts" => "kt",
+        "swift" => "swift",
+        "scala" => "scala",
+        "ruby" | "rb" => "rb",
+        "php" => "php",
+        "perl" | "pl" => "pl",
+        "lua" => "lua",
+        "r" => "r",
+        "julia" | "jl" => "jl",
+        "dart" => "dart",
+        "elixir" | "ex" | "exs" => "ex",
+        "erlang" | "erl" => "erl",
+        "haskell" | "hs" => "hs",
+        "ocaml" | "ml" => "ml",
+        "nim" => "nim",
+        "zig" => "zig",
+        "solidity" | "sol" => "sol",
+        // Web + data formats
         "json" => "json",
+        "json5" => "json5",
         "toml" => "toml",
+        "ini" => "ini",
         "yaml" | "yml" => "yml",
+        "markdown" | "md" => "md",
+        "graphql" | "gql" => "graphql",
+        "css" => "css",
+        "scss" => "scss",
+        "less" => "less",
         "html" => "html",
         "xml" => "xml",
+        "svg" => "svg",
+        "csv" => "csv",
         "sql" => "sql",
+        "proto" | "protobuf" => "proto",
+        // Tooling / config
+        "docker" | "dockerfile" => "dockerfile",
+        "make" | "makefile" => "makefile",
+        "cmake" => "cmake",
+        "nix" => "nix",
+        "diff" | "patch" => "diff",
+        "gitignore" => "gitignore",
+        "editorconfig" => "editorconfig",
+        "tex" | "latex" => "tex",
+        "plaintext" | "text" | "txt" => "txt",
         other => other,
     };
     Some(mapped.to_string())
